@@ -18,8 +18,8 @@ class TrainingDataProcessor:
 
         missing_columns = set(self.columns) - set(origin_dataset.columns)
         if missing_columns:
-            logger.error(f"Missing columns: {missing_columns}, please check the data_path: {data_path}")
-            raise ValueError(f"Missing columns: {missing_columns}, please check the data_path: {data_path}")
+            logger.error(f"Missing columns: {missing_columns}, please check the training data_path: {data_path}")
+            raise ValueError(f"Missing columns: {missing_columns}, please check the training data_path: {data_path}")
 
         data_pool = origin_dataset[self.columns].to_dict('records')
         data_pool = data_pool * epochs
