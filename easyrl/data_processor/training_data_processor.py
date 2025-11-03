@@ -8,12 +8,12 @@ logger = logging.getLogger(__name__)
 class TrainingDataProcessor:
     def __init__(self, data_path: str, batch_size: int = 64, micro_batch_size: int = 8, new_columns: List[str] = [], epochs: int = 1):
         self.columns: List[str] = ['prompt', 'ground_truth'] + new_columns
-        self.data_pool: List[Dict[str, Any]] = self.load_dataset(data_path, epochs)
+        self.data_pool: List[Dict[str, Any]] = self._load_dataset(data_path, epochs)
         self.batch_size: int = batch_size
         self.micro_batch_size: int = micro_batch_size
         self._batch_gen: Optional[Iterator[List[Dict[str, Any]]]] = None
 
-    def load_dataset(self, data_path: str, epochs: int) -> List[Dict[str, Any]]:
+    def _load_dataset(self, data_path: str, epochs: int) -> List[Dict[str, Any]]:
         origin_dataset = pd.read_parquet(data_path)
 
         missing_columns = set(self.columns) - set(origin_dataset.columns)
