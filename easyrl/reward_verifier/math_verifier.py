@@ -15,9 +15,9 @@ class MathVerifier:
 
     def verify_answer(self, judge_list):
         def _judge_one(item):
-            infer_content = item.get('infer_content', '')
+            content = item.get('content', '')
             ground_truth = item.get('ground_truth', '')
-            return self._acc_reward(infer_content, ground_truth)
+            return self._acc_reward(content, ground_truth)
 
         rewards = list(self.executor.map(_judge_one, judge_list))
         return rewards
