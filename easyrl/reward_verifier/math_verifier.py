@@ -2,24 +2,25 @@ import json
 import os
 import random
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
 
 
+def _judge_one_for_pool(item):
+    content = item.get('content', '')
+    ground_truth = item.get('ground_truth', '')
+    return MathVerifier._acc_reward(content, ground_truth)
+
+
 class MathVerifier:
     def __init__(self, max_workers: int = 128):
         self.acc_format_pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"  
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.executor = ProcessPoolExecutor(max_workers=max_workers)
 
     def verify_answer(self, judge_list):
-        def _judge_one(item):
-            content = item.get('content', '')
-            ground_truth = item.get('ground_truth', '')
-            return self._acc_reward(content, ground_truth)
-
-        rewards = list(self.executor.map(_judge_one, judge_list))
+        rewards = list(self.executor.map(_judge_one_for_pool, judge_list))
         return rewards
     
     def __del__(self):
@@ -45,21 +46,24 @@ class MathVerifier:
 
     
 
-    def _process_expression(self, s):
+    @staticmethod
+    def _process_expression(s):
         # 使用正则表达式移除所有运算符（=+、-、*、/）周围的空格
         return re.sub(r'\s*([=+\-*/])\s*', r'\1', s)
 
 
-    def _numeric_reward(self, content, sol, **kwargs):
-        content = self._clean_text(content)
-        sol = self._clean_text(sol)
+    @staticmethod
+    def _numeric_reward(content, sol, **kwargs):
+        content = MathVerifier._clean_text(content)
+        sol = MathVerifier._clean_text(sol)
         try:
             content, sol = float(content), float(sol)
             return 1.0 if content == sol else 0.0
         except:
             return None
 
-    def _clean_text(self, text, exclue_chars=['\n', '\r']):
+    @staticmethod
+    def _clean_text(text, exclue_chars=['\n', '\r']):
         # Extract content between <answer> and </answer> if present
         answer_matches = re.findall(r'<answer>(.*?)</answer>', text, re.DOTALL)
         if answer_matches:
@@ -78,7 +82,8 @@ class MathVerifier:
         # Remove leading and trailing spaces and convert to lowercase
         return text.strip().rstrip('.').lower()
 
-    def _default_accuracy_reward(self, content, sol):
+    @staticmethod
+    def _default_accuracy_reward(content, sol):
         reward = 0.0
         # Try symbolic verification first for numeric answers
         try:
@@ -139,15 +144,15 @@ class MathVerifier:
                 if student_answer and student_answer[0] == "$" and student_answer[-1] == "$":
                     student_answer = student_answer.replace("$", "")
 
-                student_answer = self._process_expression(student_answer)
-                ground_truth = self._process_expression(ground_truth)
+                student_answer = MathVerifier._process_expression(student_answer)
+                ground_truth = MathVerifier._process_expression(ground_truth)
 
                 # Strict equality
                 if student_answer == ground_truth:
                     reward = 1.0
                 else:
                     # For numeric answers, use exact numeric equality
-                    numeric_eq = self._numeric_reward(student_answer, ground_truth)
+                    numeric_eq = MathVerifier._numeric_reward(student_answer, ground_truth)
                     reward = 1.0 if numeric_eq == 1.0 else 0.0
 
             except Exception:
@@ -156,10 +161,12 @@ class MathVerifier:
         return reward if reward else 0.0
 
 
-    def _acc_reward(self, content, sol):
-        return self._default_accuracy_reward(content, sol)
+    @staticmethod
+    def _acc_reward(content, sol):
+        return MathVerifier._default_accuracy_reward(content, sol)
 
 
-    def _my_reward_fn(self, solution_str, ground_truth):
-        acc_score = self._acc_reward(solution_str, ground_truth)
+    @staticmethod
+    def _my_reward_fn(solution_str, ground_truth):
+        acc_score = MathVerifier._acc_reward(solution_str, ground_truth)
         return acc_score
