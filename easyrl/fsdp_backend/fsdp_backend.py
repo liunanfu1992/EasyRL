@@ -1,14 +1,16 @@
 import logging
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+import contextlib
+import os
+import gc
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, StateDictType
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.fsdp.api import FullStateDictConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from functools import partial
-import os
-import gc
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,10 @@ class FSDPBackend:
             self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
             self.world_size = int(os.environ.get("WORLD_SIZE", 1))
             backend = "nccl" if torch.cuda.is_available() else "gloo"
+
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29500")
+    
             dist.init_process_group(backend=backend, init_method="env://", rank=self.rank, world_size=self.world_size)
 
         if torch.cuda.is_available():
@@ -240,6 +246,75 @@ class FSDPBackend:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         
+    def _prepare_data_for_forward(self, data_list):
+        prompt_with_response = []
+        for row in data_list:
+            prompt_text = row['templated_prompt']
+            for response in row['infer_content']:
+                prompt_with_response.append((prompt_text, response))
+
+        pad_id = self.tokenizer.pad_token_id or 0
+        eos_token = self.tokenizer.eos_token
+
+        input_ids_list, labels_list, prompt_lens = [], [], []
+        max_len = 0
+
+        for prompt_text, response in prompt_with_response:
+            full_text = prompt_text + response
+            if eos_token and not full_text.endswith(eos_token):
+                full_text = full_text + eos_token
+            
+            prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False).input_ids
+            full_ids = self.tokenizer(full_text, add_special_tokens=False).input_ids
+            prompt_ids_len = len(prompt_ids)
+            label = [-100] * prompt_ids_len + full_ids[prompt_ids_len:]
+
+            input_ids_list.append(full_ids)
+            labels_list.append(label)
+            prompt_lens.append(prompt_ids_len)
+
+            max_len = max(max_len, len(full_ids))
+        
+        for i in range(len(input_ids_list)):
+            pad_len = max_len - len(input_ids_list[i])
+            input_ids_list[i] = input_ids_list[i] + [pad_id] * pad_len
+            labels_list[i] = labels_list[i] + [-100] * pad_len
+        
+        device = self.device
+        input_ids = torch.tensor(input_ids_list, device=device)
+        attention_mask = (input_ids != pad_id).to(input_ids.dtype)
+        labels = torch.tensor(labels_list, device=device)
+        return input_ids, attention_mask, labels
+
+
+    def forward_compute_logprobs(self, data_list):
+        input_ids, attention_mask, labels = self._prepare_data_for_forward(data_list)
+
+        use_amp = self.mixed_precision and torch.cuda.is_available()
+        ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16) if use_amp else contextlib.nullcontext()
+
+        with ctx:
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=None)
+            logits = outputs.logits
+
+        logits = logits.float()
+        logits_shift = logits[:, :-1, :]
+        ids_shift = input_ids[:, 1:]
+        labels_shift = labels[:, 1:]
+        attn_shift = attention_mask[:, 1:]
+
+        logprobs = F.log_softmax(logits_shift, dim=-1)
+        token_logprobs = logprobs.gather(-1, ids_shift.unsqueeze(-1)).squeeze(-1)
+        gen_mask = (labels_shift != -100) & (attn_shift > 0)
+        token_logprobs = token_logprobs * gen_mask
+
+        return token_logprobs, gen_mask
+    
+    def update_model(self):
+        max_norm = 1.0
+        FSDP.clip_grad_norm_(self.model, max_norm)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
 
 
 
