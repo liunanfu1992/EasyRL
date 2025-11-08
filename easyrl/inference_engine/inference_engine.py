@@ -1,9 +1,7 @@
 from vllm import LLM, SamplingParams
-from typing import List
 import logging
 import gc
 import torch
-from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +130,7 @@ class InferenceEngine:
             logger.info(f"Generated {len(results)} samples with {len(results[0])} responses each")
         else:
             logger.warning("No results generated (empty prompt list)")
-        return results
+        return (results, processed_prompts)
 
         
         
