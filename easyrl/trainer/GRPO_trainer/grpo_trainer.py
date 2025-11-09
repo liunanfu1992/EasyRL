@@ -5,51 +5,61 @@ from easyrl.reward_verifier.math_verifier import MathVerifier
 from easyrl.advantage_calculator.group_advantage_calculator import GroupAdvantageCalculator
 from easyrl.fsdp_backend.fsdp_backend import FSDPBackend
 from easyrl.loss_calculator.grpo_loss_calculator import GRPOLossCalculator
-import torch.distributed as dist
+from transformers import AutoTokenizer
 import torch
 import logging
-import pandas as pd
+import os        
+import shutil
 
 logger = logging.getLogger(__name__)
 
 class GRPOTrainer:
-    def __init__(self, batch_size: int = 64, micro_batch_size: int = 8, epochs: int = 10, rollout_n: int = 8, off_policy_num: int = 1, kl_loss_coeff: float = 0.0):
+    def __init__(self, batch_size: int = 64, epochs: int = 10, rollout_n: int = 8, off_policy_num: int = 1, kl_loss_coeff: float = 0.0, num_gpus: int = 8, forward_size: int = 16, backward_size: int = 4, model_path: str = '/run/determined/workdir/jiayanglyu/model_zoo/Qwen3-4B'):
         self.batch_size = batch_size
-        self.micro_batch_size = micro_batch_size
         self.epochs = epochs
         self.rollout_n = rollout_n
         self.off_policy_num = off_policy_num
         self.kl_loss_coeff = kl_loss_coeff
-        self.training_data_processor = TrainingDataProcessor(data_path='/run/determined/workdir/jiayanglyu/EasyRL/data/rl_train_with_sys_prompt.parquet', batch_size=self.batch_size, micro_batch_size=self.micro_batch_size, epochs=self.epochs)
-        self.validation_data_processor = ValidationDataProcessor(data_path='/run/determined/workdir/jiayanglyu/EasyRL/data/rl_valid_with_sys_prompt.parquet')
+        self.num_gpus = num_gpus
+        self.forward_size = forward_size
+        self.backward_size = backward_size
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.model_path = model_path
+        
+        self.training_data_processor = TrainingDataProcessor(
+            data_path='/run/determined/workdir/jiayanglyu/EasyRL/data/rl_train_with_sys_prompt.parquet',
+            batch_size=self.batch_size,
+            epochs=self.epochs
+        )
+        self.validation_data_processor = ValidationDataProcessor(
+            data_path='/run/determined/workdir/jiayanglyu/EasyRL/data/rl_valid_with_sys_prompt.parquet'
+        )
+
         self.inference_engine = None
+        self.fsdp_backend = None
         self.math_verifier = MathVerifier()
         self.group_advantage_calculator = GroupAdvantageCalculator()
-        self.fsdp_backend = None
-        self.loss_calculator = GRPOLossCalculator(kl_loss_coeff=self.kl_loss_coeff)
 
     def fit(self):
-
-        if dist.is_available() and not dist.is_initialized():
-            backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(backend=backend, init_method="env://")
-
-        is_dist = dist.is_available() and dist.is_initialized()
-        rank = dist.get_rank() if is_dist else 0
-
         curr_index = 0
+        fsdp_checkpoint_path = None  
+        vllm_checkpoint_path = None 
+        
         while True:
-            if rank == 0:
-                if self.inference_engine is None:
-                    self.inference_engine = InferenceEngine(model_path='/run/determined/workdir/jiayanglyu/model_zoo/Qwen2.5-7B', rollout_n=self.rollout_n)
-                self.inference_engine.wake_up_engine()
-
             
-            # if curr_index % 10 == 0:
-            #     validation_group = self.validation_data_processor.get_validation_group()
-            #     validation_group = self.submit_validation_task_to_inference_engine(validation_group)
-            #     validation_group = self.verify_validation_answer(validation_group)
-                
+            if self.inference_engine is None:
+                self.inference_engine = InferenceEngine(
+                    model_path=self.model_path,
+                    rollout_n=self.rollout_n
+                )
+            
+            self.inference_engine.wake_up_engine(vllm_checkpoint_path)
+
+            if curr_index % 10 == 0:
+                validation_group = self.validation_data_processor.get_validation_group()
+                validation_group = self.submit_validation_task_to_inference_engine(validation_group)
+                validation_group = self.verify_validation_answer(validation_group)
+            
 
             all_batch = []
             for _ in range(self.off_policy_num):
@@ -60,92 +70,144 @@ class GRPOTrainer:
                 curr_batch = self.verify_training_answer(curr_batch)
                 curr_batch = self.compute_advantage(curr_batch)
 
-            if rank == 0:
-                self.inference_engine.sleep_engine()
-            if is_dist:
-                dist.barrier()  
+    
+            self.inference_engine.sleep_engine()
+            logger.info(f"[Iteration {curr_index}] 推理阶段完成，vLLM已休眠")
+            
+            all_batch = self.tokenize_and_pad_all_responses(all_batch)
 
-            if self.fsdp_backend is None:
-                self.fsdp_backend = FSDPBackend(model_path='/run/determined/workdir/jiayanglyu/model_zoo/Qwen2.5-7B')
-            else:
-                self.fsdp_backend.wake_up_backend()
+            logger.info(f"[Iteration {curr_index}] 开始训练阶段...")
+            
+            self.fsdp_backend = FSDPBackend(
+                model_path=self.model_path,
+                num_processes=self.num_gpus,
+                learning_rate=1e-6,
+                cpu_offload=True,
+                checkpoint_path=fsdp_checkpoint_path  
+            )
 
+    
             old_log_probs_list = []
             for curr_batch in all_batch:
-                for micro_batch in curr_batch:
-                    with torch.no_grad():
-                        old_log_probs, _ = self.submit_micro_batch_task_to_fsdp_backend(micro_batch)
-                    old_log_probs = old_log_probs.detach() 
-                    old_log_probs_list.append(old_log_probs)
-            
-            idx = 0
-            for curr_batch in all_batch:
-                self.fsdp_backend.model.train()
-                self.fsdp_backend.optimizer.zero_grad(set_to_none=True)
-                for j, micro_batch in enumerate(curr_batch):
-                    new_log_probs, gen_mask = self.submit_micro_batch_task_to_fsdp_backend(micro_batch)
+                all_input_ids = []
+                all_labels = []
+                for row in curr_batch:
+                    for i in range(len(row['input_ids'])):
+                        all_input_ids.append(row['input_ids'][i])
+                        all_labels.append(row['labels'][i])
+                
+                total_responses = len(all_input_ids)
+                all_old_log_probs = []
+                
+                for start_idx in range(0, total_responses, self.forward_size):
+                    end_idx = start_idx + self.forward_size
+                    batch_input_ids = all_input_ids[start_idx:end_idx]
+                    batch_labels = all_labels[start_idx:end_idx]
                     
-                    advantages_flat = []
-                    for row in micro_batch:
-                        advantages_flat.extend(row['advantage'])
+                    old_log_probs_batch, _ = self.fsdp_backend.forward_compute_logprobs(
+                        batch_input_ids,
+                        batch_labels,
+                        requires_grad=False  
+                    )
+                    all_old_log_probs.append(old_log_probs_batch.cpu())
+                
+                old_log_probs_list.append(all_old_log_probs)
+            
+            for batch_idx, curr_batch in enumerate(all_batch):
+                self.fsdp_backend.set_train_mode()
+                self.fsdp_backend.zero_grad()
+                
+                all_input_ids = []
+                all_labels = []
+                all_advantages = []
+                for row in curr_batch:
+                    for i in range(len(row['input_ids'])):
+                        all_input_ids.append(row['input_ids'][i])
+                        all_labels.append(row['labels'][i])
+                        all_advantages.append(row['advantage'][i])
+                
+                total_responses = len(all_input_ids)
+                num_steps = total_responses // self.backward_size
+                
+                for step_idx in range(num_steps):
+                    start_idx = step_idx * self.backward_size
+                    end_idx = start_idx + self.backward_size
+                    
+                    batch_input_ids = all_input_ids[start_idx:end_idx]
+                    batch_labels = all_labels[start_idx:end_idx]
+                    batch_advantages = all_advantages[start_idx:end_idx]
+                    
+                    new_log_probs, gen_mask = self.fsdp_backend.forward_compute_logprobs(
+                        batch_input_ids,
+                        batch_labels,
+                        requires_grad=True  
+                    )
 
-                    device = self.fsdp_backend.device
-                    seq_level_advantages = torch.tensor(advantages_flat, dtype=torch.float32, device=device)
-                    token_level_advantages = seq_level_advantages.unsqueeze(-1).expand_as(new_log_probs) * gen_mask.float()
-                        
-                    policy_loss = self.loss_calculator.calculate_policy_loss(old_log_probs_list[idx], new_log_probs, token_level_advantages, gen_mask)
-                    kl_loss = self.loss_calculator.calculate_kl_loss(old_log_probs_list[idx], new_log_probs, gen_mask)
-                    loss = (policy_loss + kl_loss) / len(curr_batch)
-
-                    if j < len(curr_batch) - 1:
-                        with self.fsdp_backend.model.no_sync():
-                            loss.backward()
-                    else:
-                        loss.backward()
-
-                    idx += 1
+                    advantages = torch.tensor(batch_advantages, dtype=torch.float32)
+                    
+                    forward_batch_idx = start_idx // self.forward_size
+                    offset_in_forward_batch = start_idx % self.forward_size
+                    
+                    old_log_probs_batch = old_log_probs_list[batch_idx][forward_batch_idx][offset_in_forward_batch:offset_in_forward_batch + (end_idx - start_idx)]
+                    
+                    is_last = (step_idx == num_steps - 1)
+                    
+                    loss_info = self.fsdp_backend.backward_step(
+                        loss_fn={'type': 'grpo', 'kl_coeff': self.kl_loss_coeff, 'low_clip_coeff': 0.2, 'high_clip_coeff': 0.2},
+                        old_log_probs=old_log_probs_batch,
+                        advantages=advantages,
+                        is_last_micro_batch=is_last,
+                        num_accumulation_steps=num_steps
+                    )
+                    
+                    logger.info(f"Epoch {curr_index} - Batch {batch_idx} - Step {step_idx}/{num_steps} - "
+                              f"Responses [{start_idx}:{end_idx}] - "
+                              f"Policy Loss: {loss_info['policy_loss']:.4f}, "
+                              f"KL Loss: {loss_info['kl_loss']:.4f}, "
+                              f"Total Loss: {loss_info['total_loss']:.4f}")
                 
                 self.fsdp_backend.update_model()
-                logger.info(f"Epoch {curr_index} - Step {j} - Policy Loss: {policy_loss.item()}, KL Loss: {kl_loss.item()}, Loss: {loss.item()}")
 
+            checkpoint_result = self.fsdp_backend.sleep_backend()
+            self.fsdp_backend = None  
+
+            vllm_checkpoint_path, fsdp_checkpoint_path = self.ckpt_temporary_storage(checkpoint_result, vllm_checkpoint_path, fsdp_checkpoint_path)
             
             curr_index += 1
-    
-    def submit_micro_batch_task_to_fsdp_backend(self, micro_batch):
-        data_list = []
-        for row in micro_batch:
-            data_list.append({'templated_prompt': row['templated_prompt'], 'infer_content': row['infer_content']})
-        
-        return self.fsdp_backend.forward_compute_logprobs(data_list)
 
+    def ckpt_temporary_storage(self, checkpoint_result, vllm_checkpoint_path, fsdp_checkpoint_path):
+        if checkpoint_result and checkpoint_result[0] and checkpoint_result[1]:
+            new_vllm_checkpoint_path = checkpoint_result[0]  
+            new_fsdp_checkpoint_path = checkpoint_result[1]  
+                
+            if vllm_checkpoint_path and vllm_checkpoint_path != new_vllm_checkpoint_path:
+                try:
+                    if os.path.exists(vllm_checkpoint_path) and os.path.isdir(vllm_checkpoint_path):
+                        shutil.rmtree(vllm_checkpoint_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove old HF checkpoint: {e}")
+                
+            if fsdp_checkpoint_path and fsdp_checkpoint_path != new_fsdp_checkpoint_path:
+                try:
+                    if os.path.exists(fsdp_checkpoint_path):
+                        os.remove(fsdp_checkpoint_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove old FSDP checkpoint: {e}")
+            
+            return new_vllm_checkpoint_path, new_fsdp_checkpoint_path
+        else: 
+            raise ValueError("Checkpoint result is None")
 
     def submit_training_task_to_inference_engine(self, training_batch):
         prompt_list = []
-        for micro_batch in training_batch:
-            for row in micro_batch:
-                prompt_list.append(row['prompt'])
-                
-        is_dist = dist.is_available() and dist.is_initialized()
-        rank = dist.get_rank() if is_dist else 0
+        for row in training_batch:
+            prompt_list.append(row['prompt'])
+        infer_results, processed_prompts = self.inference_engine.infer_task(prompt_list, 'train')
 
-        if rank == 0:
-            infer_results, processed_prompts = self.inference_engine.infer_task(prompt_list, 'train')
-        else: 
-            infer_results, processed_prompts = None, None
-        
-        if is_dist:
-            obj = [infer_results, processed_prompts]
-            dist.broadcast_object_list(obj, src=0)
-            infer_results, processed_prompts = obj
-
-        idx = 0
-        for micro_batch in training_batch:
-            for row in micro_batch:
-                row['infer_content'] = infer_results[idx]
-                row['templated_prompt'] = processed_prompts[idx]
-                idx += 1
+        for i, row in enumerate(training_batch):
+            row['infer_content'] = infer_results[i]
+            row['templated_prompt'] = processed_prompts[i]
         return training_batch
-            
 
     def submit_validation_task_to_inference_engine(self, validation_group):
         prompt_list = []
@@ -153,18 +215,7 @@ class GRPOTrainer:
             for row in validation_group[group]['content']:
                 prompt_list.append(row['prompt'])
         
-        is_dist = dist.is_available() and dist.is_initialized()
-        rank = dist.get_rank() if is_dist else 0
-
-        if rank == 0:
-            infer_results, _ = self.inference_engine.infer_task(prompt_list, 'val')
-        else: 
-            infer_results = None
-        
-        if is_dist:
-            obj = [infer_results]
-            dist.broadcast_object_list(obj, src=0)
-            infer_results = obj[0]
+        infer_results, _ = self.inference_engine.infer_task(prompt_list, 'val')
 
         idx = 0
         for group in validation_group:
@@ -191,36 +242,73 @@ class GRPOTrainer:
 
     def verify_training_answer(self, training_batch):
         judge_list = []
-        for micro_batch in training_batch:
-            for row in micro_batch:
-                ground_truth = row['ground_truth']
-                for content in row['infer_content']:
-                    judge_list.append({'content': content, 'ground_truth': ground_truth})
+        for row in training_batch:
+            ground_truth = row['ground_truth']
+            for content in row['infer_content']:
+                judge_list.append({'content': content, 'ground_truth': ground_truth})
 
         rewards = self.math_verifier.verify_answer(judge_list)
 
         idx = 0
-        for micro_batch in training_batch:
-            for row in micro_batch:
-                row['reward'] = rewards[idx:idx+self.rollout_n]
-                idx += self.rollout_n
+        for row in training_batch:
+            row['reward'] = rewards[idx:idx+self.rollout_n]
+            idx += self.rollout_n
         return training_batch
     
     def compute_advantage(self, training_batch):
         original_reward_batch = []
-        for micro_batch in training_batch:
-            for row in micro_batch:
-                original_reward_batch.append(row['reward'])
+        for row in training_batch:
+            original_reward_batch.append(row['reward'])
         
         advantages = self.group_advantage_calculator.compute_group_advantage(original_reward_batch)
-        
-        idx = 0
-        for micro_batch in training_batch:
-            for row in micro_batch:
-                row['advantage'] = advantages[idx]
-                idx += 1
+
+        for i, row in enumerate(training_batch):
+            row['advantage'] = advantages[i]
         
         return training_batch
+    
+    def tokenize_and_pad_all_responses(self, all_batch):
+        
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        eos_token = self.tokenizer.eos_token
+        
+        max_length = 0
+        for curr_batch in all_batch:
+            for row in curr_batch:
+                prompt_text = row['templated_prompt']
+                for response in row['infer_content']:
+                    full_text = prompt_text + response
+                    if eos_token and not full_text.endswith(eos_token):
+                        full_text = full_text + eos_token
+                    full_ids = self.tokenizer(full_text, add_special_tokens=False).input_ids
+                    max_length = max(max_length, len(full_ids))
+        
+        for curr_batch in all_batch:
+            for row in curr_batch:
+                prompt_text = row['templated_prompt']
+                prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False).input_ids
+                prompt_len = len(prompt_ids)
+                
+                row['input_ids'] = []
+                row['labels'] = []
+                
+                for response in row['infer_content']:
+                    full_text = prompt_text + response
+                    if eos_token and not full_text.endswith(eos_token):
+                        full_text = full_text + eos_token
+                    
+                    full_ids = self.tokenizer(full_text, add_special_tokens=False).input_ids
+                    labels = [-100] * prompt_len + full_ids[prompt_len:]
+                    
+                    pad_len = max_length - len(full_ids)
+                    if pad_len > 0:
+                        full_ids = full_ids + [pad_id] * pad_len
+                        labels = labels + [-100] * pad_len
+                    
+                    row['input_ids'].append(full_ids)
+                    row['labels'].append(labels)
+        
+        return all_batch
 
 
 if __name__ == "__main__":
