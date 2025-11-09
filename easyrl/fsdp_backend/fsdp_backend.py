@@ -2,33 +2,46 @@ import logging
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.multiprocessing as mp
 import contextlib
 import os
 import gc
+import time
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, StateDictType
+from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, CPUOffload, StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.distributed.fsdp.api import FullStateDictConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from easyrl.loss_calculator.grpo_loss_calculator import GRPOLossCalculator
 from functools import partial
+from transformers import AutoConfig
 
 
 logger = logging.getLogger(__name__)
 
+
+_WORKER_MODEL = None
+_WORKER_TOKENIZER = None
+_WORKER_OPTIMIZER = None
+_WORKER_RANK = None
+_WORKER_DEVICE = None
+_WORKER_ACCUMULATED_LOSS = None
+
+
 class FSDPBackend:
-    def __init__(self, model_path: str, learning_rate: float = 1e-5, mixed_precision: bool = True, sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD):
+    def __init__(self, model_path: str, learning_rate: float = 1e-5, mixed_precision: bool = True, 
+                 sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD, num_processes: int = 8,
+                 cpu_offload: bool = False, checkpoint_dir: str = "/dev/shm", checkpoint_path: str = None):
         self.model_path = model_path
         self.learning_rate = learning_rate
         self.mixed_precision = mixed_precision
         self.sharding_strategy = sharding_strategy
-
-        self._init_distributed()
-        self.device = torch.device(f"cuda:{self.local_rank}")
-
-        self.tokenizer = None
-        self.model = None
-        self.optimizer = None
-
+        self.num_processes = num_processes
+        self.cpu_offload = cpu_offload
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_path = checkpoint_path  
+        
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
         self.mixed_precision_policy = None
         if mixed_precision:
             self.mixed_precision_policy = MixedPrecision(
@@ -37,284 +50,511 @@ class FSDPBackend:
                 buffer_dtype=torch.float32,
             )
         
-        self._init_model()
-
-    def _init_distributed(self):
-        if dist.is_initialized():
-            self.rank = dist.get_rank()
-            self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            self.world_size = dist.get_world_size()
-        else:
-            self.rank = int(os.environ.get("RANK", 0))
-            self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            self.world_size = int(os.environ.get("WORLD_SIZE", 1))
-            backend = "nccl" if torch.cuda.is_available() else "gloo"
-
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29500")
-    
-            dist.init_process_group(backend=backend, init_method="env://", rank=self.rank, world_size=self.world_size)
-
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.local_rank)
+        self.request_queue = None
+        self.response_queue = None
+        self.worker_processes = None
         
-    def _init_model(self):
-        if self.rank == 0:
-            logger.info(f"Loading model from {self.model_path}")
+        logger.info(f"FSDPBackend initialized with {num_processes} processes")
         
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
-        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self._start_workers()
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map=None,  
-        )
-
-        transformer_layer_cls_names = getattr(self.model, "_no_split_modules", None) 
-        transformer_cls_to_wrap = set()
-
-        if transformer_layer_cls_names:  
-            name_to_class = {}
-            for m in self.model.modules():
-                name_to_class[m.__class__.__name__] = m.__class__
-
-            for name in transformer_layer_cls_names:
-                if name in name_to_class:
-                    transformer_cls_to_wrap.add(name_to_class[name])
-                else:
-                    logger.warning(f"_no_split_modules item not found as class on scan: {name}")
-
-
-        if len(transformer_cls_to_wrap) == 0:
-            raise ValueError("No transformer layer classes to wrap")
-
-        auto_wrap_policy = partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=tuple(transformer_cls_to_wrap)
-        )
+    def _start_workers(self):
+        ctx = mp.get_context('spawn')
+        self.request_queue = ctx.Queue()
+        self.response_queue = ctx.Queue()
         
-        self.model = FSDP(
-            self.model,
-            sharding_strategy=self.sharding_strategy,
-            mixed_precision=self.mixed_precision_policy,
-            auto_wrap_policy=auto_wrap_policy,
-            device_id=self.local_rank,
-            sync_module_states=True,
-            use_orig_params=True
-        )
+        self.worker_processes = []
+        for rank in range(self.num_processes):
+            p = ctx.Process(
+                target=_worker_main,
+                args=(rank, self.num_processes, self.model_path, self.learning_rate,
+                      self.mixed_precision_policy, self.sharding_strategy, self.cpu_offload,
+                      self.request_queue, self.response_queue, self.checkpoint_path)
+            )
+            p.start()
+            self.worker_processes.append(p)
+        
+        for _ in range(self.num_processes):
+            status = self.response_queue.get()
+            if status != 'ready':
+                raise RuntimeError(f"Worker initialization failed: {status}")
+        
+        logger.info(f"All {self.num_processes} FSDP workers are ready")
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.learning_rate,
-        )
-        if self.rank == 0:
-            logger.info(f"Model and optimizer initialized successfully on rank {self.rank}")
+    def forward_compute_logprobs(self, input_ids_list, labels_list, requires_grad=True):
+        self.request_queue.put(('forward', {'input_ids': input_ids_list, 'labels': labels_list, 'requires_grad': requires_grad}))
+        result = self.response_queue.get()
+        
+        if isinstance(result, Exception):
+            raise result
+        
+        return result
+
+    def backward_step(self, loss_fn, old_log_probs, advantages, is_last_micro_batch, num_accumulation_steps=1):
+        self.request_queue.put(('backward', {
+            'loss_fn': loss_fn,
+            'old_log_probs': old_log_probs,
+            'advantages': advantages,
+            'is_last': is_last_micro_batch,
+            'num_accumulation_steps': num_accumulation_steps
+        }))
+        
+        result = self.response_queue.get()
+        if isinstance(result, Exception):
+            raise result
+        
+        return result
+
+    def update_model(self):
+        self.request_queue.put(('update', None))
+        
+        for _ in range(self.num_processes):
+            status = self.response_queue.get()
+            if status != 'updated':
+                raise RuntimeError(f"Model update failed: {status}")
+
+    def set_train_mode(self):
+        self.request_queue.put(('set_train', None))
+        for _ in range(self.num_processes):
+            self.response_queue.get()
+
+    def zero_grad(self):
+        self.request_queue.put(('zero_grad', None))
+        for _ in range(self.num_processes):
+            self.response_queue.get()
 
     def sleep_backend(self):
-        if dist.is_initialized():
-            dist.barrier()
-
-        self._aggressive_empty_cache(force_sync=True)
-
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_policy):
-            state_dict = self.model.state_dict()
-
-        if self.model is not None:
-            for p in self.model.parameters():
-                p.grad = None
-
-            for module in self.model.modules():
-                for name, buf in module.named_buffers(recurse=False):
-                    if buf.is_cuda:
-                        module._buffers[name] = buf.to("cpu", non_blocking=True)
-
-        self._offload_model_to_cpu()
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        if self.optimizer is not None:
-            try:
-                self._saved_optim_state = FSDP.optim_state_dict(self.model, self.optimizer)
-            except Exception as e:
-                logger.warning(f"Failed to collect optimizer state dict for CPU offload: {e}")
-                self._saved_optim_state = None
-            self.optimizer = None
-
-        self._aggressive_empty_cache(force_sync=True)
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        return state_dict
-
-    def wake_up_backend(self):
-        if dist.is_initialized():
-            dist.barrier()
-
-        device = torch.device(f"cuda:{self.local_rank}")
-        self._load_model_to_gpu()
-
-        if self.model is not None:
-            for module in self.model.modules():
-                for name, buf in module.named_buffers(recurse=False):
-                    if not buf.is_cuda:
-                        module._buffers[name] = buf.to(device, non_blocking=True)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.learning_rate,
+        checkpoint_path = os.path.join(
+            self.checkpoint_dir,
+            f"fsdp_checkpoint_{int(time.time())}.pt"
         )
-
-        if hasattr(self, "_saved_optim_state") and self._saved_optim_state is not None:
-            try:
-                sharded_osd = FSDP.shard_full_optim_state_dict(self._saved_optim_state, self.model)
-                self.optimizer.load_state_dict(sharded_osd)
-                device = torch.device(f"cuda:{self.local_rank}")
-                for state in self.optimizer.state.values():
-                    for k, v in state.items():
-                        if torch.is_tensor(v) and not v.is_cuda:
-                            state[k] = v.to(device, non_blocking=True)
-               
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-            except Exception as e:
-                logger.warning(f"Failed to restore optimizer state from saved CPU snapshot: {e}")
-            finally:
-                self._saved_optim_state = None
-
-        if dist.is_initialized():
-            dist.barrier()
-    
-    def _offload_model_to_cpu(self):
-        if self.model is None:
-            return
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         
-        for handle in self.model._all_handles:  
-            if handle._offload_params:  
-                continue  
-            flat_param = handle.flat_param  
-            handle.flat_param_to(torch.device("cpu"), non_blocking=True)  
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()  
-        gc.collect()
-    
-    def _aggressive_empty_cache(self, force_sync: bool = True, max_retries: int = 3):  
-        if not torch.cuda.is_available():  
-            return  
+        logger.info(f"FSDP backend shutting down, saving checkpoint to {checkpoint_path}...")
+        self.request_queue.put(('save_and_shutdown', checkpoint_path))
         
-        for attempt in range(max_retries):  
-            before_reserved = torch.cuda.memory_reserved()  
-            gc.collect()  
-            torch.cuda.empty_cache()  
-            
-            if force_sync and torch.cuda.is_available():
-                torch.cuda.synchronize()  
-            
-            after_reserved = torch.cuda.memory_reserved()  
-            reserved_freed = before_reserved - after_reserved  
+        hf_checkpoint_dir = None
+        fsdp_checkpoint_path = None
+        
+        for _ in range(self.num_processes):
+            status = self.response_queue.get()
+            if isinstance(status, tuple) and status[0] == 'saved':
+                hf_checkpoint_dir = status[1]
+                fsdp_checkpoint_path = status[2]
+            elif status != 'shutdown_ready':
+                raise RuntimeError(f"Save and shutdown failed: {status}")
+        
+        logger.info("All workers saved state, terminating processes...")
+        
+        for p in self.worker_processes:
+            p.join(timeout=30)
+            if p.is_alive():
+                logger.warning(f"Worker process {p.pid} did not terminate, forcing...")
+                p.terminate()
+                p.join(timeout=5)
+        
+        if hf_checkpoint_dir and fsdp_checkpoint_path:
+            logger.info(f"FSDP backend destroyed")
+            logger.info(f"  - HuggingFace format (for vLLM): {hf_checkpoint_dir}")
+            logger.info(f"  - Full checkpoint (for FSDP): {fsdp_checkpoint_path}")
+            return (hf_checkpoint_dir, fsdp_checkpoint_path)
+        else:
+            logger.error("Failed to create checkpoint")
+            return (None, None)
 
-            if reserved_freed < 1024**3:  
+    def shutdown(self):
+        logger.info("Shutting down FSDP backend...")
+        self.request_queue.put(('shutdown', None))
+        
+        for p in self.worker_processes:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.terminate()
+        
+        logger.info("FSDP backend shut down")
+
+    @property  
+    def device(self):
+        return torch.device('cuda:0')
+
+
+def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_policy, 
+                 sharding_strategy, cpu_offload, request_queue, response_queue, checkpoint_path=None):
+    global _WORKER_MODEL, _WORKER_TOKENIZER, _WORKER_OPTIMIZER, _WORKER_RANK, _WORKER_DEVICE
+    global _WORKER_ACCUMULATED_LOSS
+    
+    try:
+        os.environ['RANK'] = str(rank)
+        os.environ['LOCAL_RANK'] = str(rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '29600'
+        
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://", rank=rank, world_size=world_size)
+        
+        if torch.cuda.is_available():
+            torch.cuda.set_device(rank)
+        
+        _WORKER_DEVICE = torch.device(f"cuda:{rank}")
+        _WORKER_RANK = rank
+        _WORKER_ACCUMULATED_LOSS = None
+        
+        _init_model(model_path, mixed_precision_policy, sharding_strategy, cpu_offload, rank)
+        _WORKER_OPTIMIZER = torch.optim.AdamW(_WORKER_MODEL.parameters(), lr=learning_rate)
+        
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            _load_checkpoint(checkpoint_path, rank)
+        
+        if rank == 0:
+            logger.info(f"Worker {rank} initialized successfully")
+        
+        if rank == 0:
+            response_queue.put('ready')
+        
+        dist.barrier()
+        if rank == 0:
+            for _ in range(1, world_size):
+                response_queue.put('ready')
+        
+        last_forward_result = None  
+        no_sync_context = None
+        
+        while True:
+            if rank == 0:
+                task, data = request_queue.get()
+                task_data = [task, data]
+            else:
+                task_data = [None, None]
+            
+            dist.broadcast_object_list(task_data, src=0)
+            task, data = task_data
+            
+            if task == 'shutdown':
+                logger.info(f"Worker {rank}: Received shutdown signal")
+                dist.barrier()
+                dist.destroy_process_group()
+                logger.info(f"Worker {rank}: Process group destroyed, exiting...")
                 break
             
-    def _load_model_to_gpu(self):  
-        if self.model is None:  
-            return  
-        
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        
-        device = torch.device(f"cuda:{self.local_rank}")  
-        
-        for handle in self.model._all_handles:  
-            if handle._offload_params:  
-                continue  
-            flat_param = handle.flat_param  
-            handle.flat_param_to(device, non_blocking=True)
-        
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        
-    def _prepare_data_for_forward(self, data_list):
-        prompt_with_response = []
-        for row in data_list:
-            prompt_text = row['templated_prompt']
-            for response in row['infer_content']:
-                prompt_with_response.append((prompt_text, response))
-
-        pad_id = self.tokenizer.pad_token_id or 0
-        eos_token = self.tokenizer.eos_token
-
-        input_ids_list, labels_list, prompt_lens = [], [], []
-        max_len = 0
-
-        for prompt_text, response in prompt_with_response:
-            full_text = prompt_text + response
-            if eos_token and not full_text.endswith(eos_token):
-                full_text = full_text + eos_token
+            elif task == 'forward':
+                input_ids_list = data['input_ids']
+                labels_list = data['labels']
+                requires_grad = data.get('requires_grad', True)
+                
+                if requires_grad:
+                    last_forward_result = _forward_compute_logprobs(input_ids_list, labels_list, rank)
+                    if rank == 0:
+                        token_logprobs_detached = last_forward_result['token_logprobs'].detach().cpu()
+                        gen_mask = last_forward_result['gen_mask'].cpu()
+                        response_queue.put((token_logprobs_detached, gen_mask))
+                else:
+                    with torch.no_grad():
+                        result = _forward_compute_logprobs(input_ids_list, labels_list, rank)
+                    if rank == 0:
+                        token_logprobs = result['token_logprobs'].cpu()
+                        gen_mask = result['gen_mask'].cpu()
+                        response_queue.put((token_logprobs, gen_mask))
             
-            prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False).input_ids
-            full_ids = self.tokenizer(full_text, add_special_tokens=False).input_ids
-            prompt_ids_len = len(prompt_ids)
-            label = [-100] * prompt_ids_len + full_ids[prompt_ids_len:]
+            elif task == 'backward':
+                if last_forward_result is None:
+                    raise RuntimeError("Must call forward before backward")
+                
+                loss_info = _backward_step(
+                    last_forward_result,
+                    data['loss_fn'],
+                    data['old_log_probs'],
+                    data['advantages'],
+                    data['is_last'],
+                    rank,
+                    no_sync_context,
+                    data.get('num_accumulation_steps', 1)
+                )
+                
+                if rank == 0:
+                    response_queue.put(loss_info)
+                
+                last_forward_result = None
+            
+            elif task == 'update':
+                max_norm = 1.0
+                FSDP.clip_grad_norm_(_WORKER_MODEL, max_norm)
+                _WORKER_OPTIMIZER.step()
+                _WORKER_OPTIMIZER.zero_grad()
+                if rank == 0:
+                    for _ in range(world_size):
+                        response_queue.put('updated')
+            
+            elif task == 'set_train':
+                _WORKER_MODEL.train()
+                if rank == 0:
+                    for _ in range(world_size):
+                        response_queue.put('ok')
+            
+            elif task == 'zero_grad':
+                _WORKER_OPTIMIZER.zero_grad(set_to_none=True)
+                if rank == 0:
+                    for _ in range(world_size):
+                        response_queue.put('ok')
+            
+            elif task == 'save_and_shutdown':
+                checkpoint_path = data
+                
+                with FSDP.state_dict_type(_WORKER_MODEL, 
+                                         StateDictType.FULL_STATE_DICT,
+                                         FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
+                    full_model_state_dict = _WORKER_MODEL.state_dict()
+                    full_optimizer_state_dict = FSDP.full_optim_state_dict(_WORKER_MODEL, _WORKER_OPTIMIZER)
+                
+                if rank == 0:
+                    cleaned_model_state_dict = {}
+                    for k, v in full_model_state_dict.items():
+                        new_k = k.replace('_fsdp_wrapped_module.', '')
+                        cleaned_model_state_dict[new_k] = v.cpu()
+                    
+                    import shutil
+                    hf_checkpoint_dir = checkpoint_path.replace('.pt', '_hf')
+                    
+                    if os.path.exists(hf_checkpoint_dir):
+                        shutil.rmtree(hf_checkpoint_dir)
+                    os.makedirs(hf_checkpoint_dir, exist_ok=True)
+                    
+                    model_save_path = os.path.join(hf_checkpoint_dir, 'pytorch_model.bin')
+                    torch.save(cleaned_model_state_dict, model_save_path)
+                    
+                    try:
+                        config = AutoConfig.from_pretrained(_WORKER_TOKENIZER.name_or_path, trust_remote_code=True)
+                        config.save_pretrained(hf_checkpoint_dir)
+                        _WORKER_TOKENIZER.save_pretrained(hf_checkpoint_dir)
+                    except Exception as e:
+                        logger.warning(f"Failed to save config/tokenizer: {e}")
+                    
+                    optimizer_path = checkpoint_path 
+                    checkpoint = {
+                        'model_state_dict': cleaned_model_state_dict,
+                        'optimizer_state_dict': full_optimizer_state_dict,
+                    }
+                    torch.save(checkpoint, optimizer_path)
+                    
+                    logger.info(f"Worker {rank}: Saved HuggingFace format to {hf_checkpoint_dir}")
+                    logger.info(f"Worker {rank}: Saved full checkpoint (with optimizer) to {optimizer_path}")
+                    
+                  
+                    response_queue.put(('saved', hf_checkpoint_dir, optimizer_path))
+                    del full_model_state_dict, full_optimizer_state_dict, cleaned_model_state_dict, checkpoint
+                else:
+                    response_queue.put('shutdown_ready')
+                
+                dist.barrier()
+                
 
-            input_ids_list.append(full_ids)
-            labels_list.append(label)
-            prompt_lens.append(prompt_ids_len)
-
-            max_len = max(max_len, len(full_ids))
+                logger.info(f"Worker {rank}: Destroying process group...")
+                dist.destroy_process_group()
+                logger.info(f"Worker {rank}: Process group destroyed, exiting...")
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                
+                break
         
-        for i in range(len(input_ids_list)):
-            pad_len = max_len - len(input_ids_list[i])
-            input_ids_list[i] = input_ids_list[i] + [pad_id] * pad_len
-            labels_list[i] = labels_list[i] + [-100] * pad_len
-        
-        device = self.device
-        input_ids = torch.tensor(input_ids_list, device=device)
-        attention_mask = (input_ids != pad_id).to(input_ids.dtype)
-        labels = torch.tensor(labels_list, device=device)
-        return input_ids, attention_mask, labels
+    except Exception as e:
+        logger.error(f"Worker {rank} error: {e}")
+        import traceback
+        traceback.print_exc()
+        if rank == 0:
+            response_queue.put(e)
+        raise
 
 
-    def forward_compute_logprobs(self, data_list):
-        input_ids, attention_mask, labels = self._prepare_data_for_forward(data_list)
-
-        use_amp = self.mixed_precision and torch.cuda.is_available()
-        ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16) if use_amp else contextlib.nullcontext()
-
-        with ctx:
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=None)
-            logits = outputs.logits
-
-        logits = logits.float()
-        logits_shift = logits[:, :-1, :]
-        ids_shift = input_ids[:, 1:]
-        labels_shift = labels[:, 1:]
-        attn_shift = attention_mask[:, 1:]
-
-        logprobs = F.log_softmax(logits_shift, dim=-1)
-        token_logprobs = logprobs.gather(-1, ids_shift.unsqueeze(-1)).squeeze(-1)
-        gen_mask = (labels_shift != -100) & (attn_shift > 0)
-        token_logprobs = token_logprobs * gen_mask
-
-        return token_logprobs, gen_mask
+def _load_checkpoint(checkpoint_path, rank):
+    global _WORKER_MODEL, _WORKER_OPTIMIZER
     
-    def update_model(self):
-        max_norm = 1.0
-        FSDP.clip_grad_norm_(self.model, max_norm)
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+    if rank == 0:
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    if 'model_state_dict' in checkpoint:
+        model_state_dict = checkpoint['model_state_dict']
+        
+
+        wrapped_state_dict = {}
+        for k, v in model_state_dict.items():
+            if not k.startswith('_fsdp_wrapped_module.'):
+                wrapped_state_dict[f'_fsdp_wrapped_module.{k}'] = v
+            else:
+                wrapped_state_dict[k] = v
+        
+        _WORKER_MODEL.load_state_dict(wrapped_state_dict, strict=False)
+        
+        if rank == 0:
+            logger.info(f"Loaded {len(model_state_dict)} model parameters from checkpoint")
+    
+    if 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
+        _WORKER_OPTIMIZER.load_state_dict(checkpoint['optimizer_state_dict'])
+        if rank == 0:
+            logger.info("Loaded optimizer state from checkpoint")
+    
+    del checkpoint
+    
+    if rank == 0:
+        logger.info("Checkpoint loaded successfully")
 
 
+def _init_model(model_path, mixed_precision_policy, sharding_strategy, cpu_offload, rank):
+    global _WORKER_MODEL, _WORKER_TOKENIZER
+    
+    _WORKER_TOKENIZER = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if _WORKER_TOKENIZER.pad_token is None and _WORKER_TOKENIZER.eos_token is not None:
+        _WORKER_TOKENIZER.pad_token = _WORKER_TOKENIZER.eos_token
+    
+    if rank == 0:
+        logger.info(f"Loading model from {model_path}")
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        device_map=None,
+    )
+    
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        if rank == 0:
+            logger.info("Gradient checkpointing enabled")
+    
+    transformer_layer_cls_names = getattr(model, "_no_split_modules", None)
+    transformer_cls_to_wrap = set()
+    
+    if transformer_layer_cls_names:
+        name_to_class = {}
+        for m in model.modules():
+            name_to_class[m.__class__.__name__] = m.__class__
+        
+        for name in transformer_layer_cls_names:
+            if name in name_to_class:
+                transformer_cls_to_wrap.add(name_to_class[name])
+    
+    if len(transformer_cls_to_wrap) == 0:
+        raise ValueError("No transformer layer classes to wrap")
+    
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=tuple(transformer_cls_to_wrap)
+    )
+    
+    cpu_offload_policy = None
+    if cpu_offload:
+        cpu_offload_policy = CPUOffload(offload_params=True)
+        if rank == 0:
+            logger.info("CPU offload enabled for parameters")
+    
+    _WORKER_MODEL = FSDP(
+        model,
+        sharding_strategy=sharding_strategy,
+        mixed_precision=mixed_precision_policy,
+        auto_wrap_policy=auto_wrap_policy,
+        device_id=rank,
+        sync_module_states=True,
+        use_orig_params=True,
+        limit_all_gathers=True,  
+        cpu_offload=cpu_offload_policy 
+    )
 
+
+def _forward_compute_logprobs(input_ids_list, labels_list, rank):
+    global _WORKER_MODEL, _WORKER_TOKENIZER, _WORKER_DEVICE
+    
+    device = _WORKER_DEVICE
+    pad_id = _WORKER_TOKENIZER.pad_token_id or 0
+    
+    input_ids = torch.tensor(input_ids_list, device=device)
+    labels = torch.tensor(labels_list, device=device)
+    attention_mask = (input_ids != pad_id).to(input_ids.dtype)
+    
+    use_amp = _WORKER_MODEL.mixed_precision is not None and torch.cuda.is_available()
+    ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16) if use_amp else contextlib.nullcontext()
+    
+    with ctx:
+        outputs = _WORKER_MODEL(input_ids=input_ids, attention_mask=attention_mask, labels=None)
+        logits = outputs.logits
+    
+    logits = logits.float()
+    logits_shift = logits[:, :-1, :]  
+    ids_shift = input_ids[:, 1:]      
+    labels_shift = labels[:, 1:]
+    attn_shift = attention_mask[:, 1:]
+    
+    target_logits = logits_shift.gather(-1, ids_shift.unsqueeze(-1)).squeeze(-1)  
+    logsumexp = torch.stack([
+        torch.logsumexp(logit, dim=-1) 
+        for logit in logits_shift
+    ]) 
+    
+    del logits, logits_shift, outputs
+    
+    token_logprobs = target_logits - logsumexp 
+    
+    del target_logits, logsumexp
+    
+    gen_mask = (labels_shift != -100) & (attn_shift > 0)
+    token_logprobs = token_logprobs * gen_mask
+    
+    return {
+        'token_logprobs': token_logprobs,
+        'gen_mask': gen_mask
+    }
+
+
+def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is_last, rank, no_sync_context, num_accumulation_steps=1):
+    global _WORKER_MODEL
+    
+    new_log_probs = forward_result['token_logprobs']
+    gen_mask = forward_result['gen_mask']
+    
+    device = new_log_probs.device
+    old_log_probs = old_log_probs.to(device)
+    advantages = advantages.to(device)
+    
+    token_level_advantages = advantages.unsqueeze(-1).expand_as(new_log_probs) * gen_mask.float()
+
+
+    kl_coeff = loss_fn_config.get('kl_coeff', 0.0)
+    low_clip = loss_fn_config.get('low_clip_coeff', 0.2)
+    high_clip = loss_fn_config.get('high_clip_coeff', 0.2)
+    
+    loss_calculator = GRPOLossCalculator(
+        low_clip_coffe=low_clip,
+        high_clip_coffe=high_clip,
+        kl_loss_coeff=kl_coeff
+    )
+
+    policy_loss = loss_calculator.calculate_policy_loss(
+        old_log_probs, 
+        new_log_probs, 
+        token_level_advantages, 
+        gen_mask
+    )
+    
+    if kl_coeff > 0:
+        kl_loss = loss_calculator.calculate_kl_loss(
+            old_log_probs,
+            new_log_probs,
+            gen_mask
+        )
+    else:
+        kl_loss = torch.tensor(0.0, device=device)
+    
+    total_loss = (policy_loss + kl_loss) / num_accumulation_steps
+    
+    if is_last:
+        total_loss.backward()
+    else:
+        with _WORKER_MODEL.no_sync():
+            total_loss.backward()
+    
+    return {
+        'policy_loss': policy_loss.item(),
+        'kl_loss': kl_loss.item(),
+        'total_loss': total_loss.item()
+    }
