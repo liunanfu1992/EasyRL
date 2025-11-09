@@ -1,2 +1,10 @@
-  export TOKENIZERS_PARALLELISM=false
-  torchrun --nproc_per_node=8 --master_addr 127.0.0.1 --master_port 29500 -m easyrl.trainer.GRPO_trainer.grpo_trainer
+
+
+export TOKENIZERS_PARALLELISM=false
+
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+
+# 直接用Python启动，不使用torchrun
+python -m easyrl.trainer.GRPO_trainer.grpo_trainer
+
