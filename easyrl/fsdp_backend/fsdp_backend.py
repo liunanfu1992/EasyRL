@@ -6,7 +6,6 @@ import torch.multiprocessing as mp
 import contextlib
 import os
 import gc
-import time
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, CPUOffload, StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -126,7 +125,7 @@ class FSDPBackend:
     def sleep_backend(self):
         checkpoint_path = os.path.join(
             self.checkpoint_dir,
-            f"fsdp_checkpoint_{int(time.time())}.pt"
+            "fsdp_checkpoint_latest.pt"  # 固定名字，自动覆盖
         )
         
         logger.info(f"FSDP backend shutting down, saving checkpoint to {checkpoint_path}...")
@@ -303,7 +302,7 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                                          StateDictType.FULL_STATE_DICT,
                                          FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
                     full_model_state_dict = _WORKER_MODEL.state_dict()
-                    full_optimizer_state_dict = FSDP.full_optim_state_dict(_WORKER_MODEL, _WORKER_OPTIMIZER)
+                    full_optimizer_state_dict = FSDP.optim_state_dict(_WORKER_MODEL, _WORKER_OPTIMIZER)
                 
                 if rank == 0:
                     cleaned_model_state_dict = {}
@@ -312,7 +311,7 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                         cleaned_model_state_dict[new_k] = v.cpu()
                     
                     import shutil
-                    hf_checkpoint_dir = checkpoint_path.replace('.pt', '_hf')
+                    hf_checkpoint_dir = checkpoint_path.replace('.pt', '_hf') 
                     
                     if os.path.exists(hf_checkpoint_dir):
                         shutil.rmtree(hf_checkpoint_dir)
@@ -391,7 +390,12 @@ def _load_checkpoint(checkpoint_path, rank):
             logger.info(f"Loaded {len(model_state_dict)} model parameters from checkpoint")
     
     if 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
-        _WORKER_OPTIMIZER.load_state_dict(checkpoint['optimizer_state_dict'])
+        full_optimizer_state_dict = checkpoint['optimizer_state_dict']
+        sharded_optimizer_state_dict = FSDP.shard_full_optim_state_dict(
+            full_optimizer_state_dict,
+            _WORKER_MODEL
+        )
+        _WORKER_OPTIMIZER.load_state_dict(sharded_optimizer_state_dict)
         if rank == 0:
             logger.info("Loaded optimizer state from checkpoint")
     
@@ -478,8 +482,7 @@ def _forward_compute_logprobs(input_ids_list, labels_list, rank):
     with ctx:
         outputs = _WORKER_MODEL(input_ids=input_ids, attention_mask=attention_mask, labels=None)
         logits = outputs.logits
-    
-    logits = logits.float()
+
     logits_shift = logits[:, :-1, :]  
     ids_shift = input_ids[:, 1:]      
     labels_shift = labels[:, 1:]
@@ -494,6 +497,7 @@ def _forward_compute_logprobs(input_ids_list, labels_list, rank):
     del logits, logits_shift, outputs
     
     token_logprobs = target_logits - logsumexp 
+    token_logprobs = token_logprobs.float()
     
     del target_logits, logsumexp
     
