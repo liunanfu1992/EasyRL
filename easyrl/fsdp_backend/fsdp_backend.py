@@ -13,6 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from easyrl.loss_calculator.grpo_loss_calculator import GRPOLossCalculator
 from functools import partial
 from transformers import AutoConfig
+from safetensors.torch import save_file
 
 
 logger = logging.getLogger(__name__)
@@ -125,7 +126,7 @@ class FSDPBackend:
     def sleep_backend(self):
         checkpoint_path = os.path.join(
             self.checkpoint_dir,
-            "fsdp_checkpoint_latest.pt"  # 固定名字，自动覆盖
+            "fsdp_checkpoint_latest.pt"  
         )
         
         logger.info(f"FSDP backend shutting down, saving checkpoint to {checkpoint_path}...")
@@ -236,33 +237,58 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                 break
             
             elif task == 'forward':
-                input_ids_list = data['input_ids']
-                labels_list = data['labels']
+                all_input_ids = data['input_ids']
+                all_labels = data['labels']
                 requires_grad = data.get('requires_grad', True)
                 
+                per_rank_size = len(all_input_ids) // world_size
+                start_idx = rank * per_rank_size
+                end_idx = start_idx + per_rank_size
+                
+                my_input_ids = all_input_ids[start_idx:end_idx]
+                my_labels = all_labels[start_idx:end_idx]
+                
                 if requires_grad:
-                    last_forward_result = _forward_compute_logprobs(input_ids_list, labels_list, rank)
+                    my_result = _forward_compute_logprobs(my_input_ids, my_labels, rank)
+                    last_forward_result = my_result  
+                    
                     if rank == 0:
-                        token_logprobs_detached = last_forward_result['token_logprobs'].detach().cpu()
-                        gen_mask = last_forward_result['gen_mask'].cpu()
-                        response_queue.put((token_logprobs_detached, gen_mask))
+                        response_queue.put((None, None))
                 else:
                     with torch.no_grad():
-                        result = _forward_compute_logprobs(input_ids_list, labels_list, rank)
+                        my_result = _forward_compute_logprobs(my_input_ids, my_labels, rank)
+                    
+                    all_results = [None] * world_size
+                    dist.all_gather_object(all_results, my_result)
+                    
                     if rank == 0:
-                        token_logprobs = result['token_logprobs'].cpu()
-                        gen_mask = result['gen_mask'].cpu()
-                        response_queue.put((token_logprobs, gen_mask))
+                        token_logprobs_list = [r['token_logprobs'].cpu() for r in all_results]
+                        gen_mask_list = [r['gen_mask'].cpu() for r in all_results]
+                        
+                        combined_logprobs = torch.cat(token_logprobs_list, dim=0)
+                        combined_mask = torch.cat(gen_mask_list, dim=0)
+                        
+                        response_queue.put((combined_logprobs, combined_mask))
             
             elif task == 'backward':
                 if last_forward_result is None:
                     raise RuntimeError("Must call forward before backward")
                 
+                all_old_log_probs = data['old_log_probs']
+                all_advantages = data['advantages']
+                
+                per_rank_size = len(all_old_log_probs) // world_size
+                start_idx = rank * per_rank_size
+                end_idx = start_idx + per_rank_size
+                
+                my_old_log_probs = all_old_log_probs[start_idx:end_idx]
+                my_advantages = all_advantages[start_idx:end_idx]
+                
                 loss_info = _backward_step(
-                    last_forward_result,
+                    last_forward_result,  
                     data['loss_fn'],
-                    data['old_log_probs'],
-                    data['advantages'],
+                    my_old_log_probs,
+                    my_advantages,
                     data['is_last'],
                     rank,
                     no_sync_context,
@@ -317,8 +343,9 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                         shutil.rmtree(hf_checkpoint_dir)
                     os.makedirs(hf_checkpoint_dir, exist_ok=True)
                     
-                    model_save_path = os.path.join(hf_checkpoint_dir, 'pytorch_model.bin')
-                    torch.save(cleaned_model_state_dict, model_save_path)
+                    safetensors_path = os.path.join(hf_checkpoint_dir, 'model.safetensors')
+                    save_file(cleaned_model_state_dict, safetensors_path)
+                    logger.info(f"Worker {rank}: Saved safetensors format to {safetensors_path}")
                     
                     try:
                         config = AutoConfig.from_pretrained(_WORKER_TOKENIZER.name_or_path, trust_remote_code=True)
@@ -557,8 +584,16 @@ def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is
         with _WORKER_MODEL.no_sync():
             total_loss.backward()
     
+    policy_loss_tensor = torch.tensor(policy_loss.item(), device=device)
+    kl_loss_tensor = torch.tensor(kl_loss.item(), device=device)
+    total_loss_tensor = torch.tensor(total_loss.item(), device=device)
+
+    dist.all_reduce(policy_loss_tensor, op=dist.ReduceOp.AVG)
+    dist.all_reduce(kl_loss_tensor, op=dist.ReduceOp.AVG)
+    dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.AVG)
+    
     return {
-        'policy_loss': policy_loss.item(),
-        'kl_loss': kl_loss.item(),
-        'total_loss': total_loss.item()
+        'policy_loss': policy_loss_tensor.item(),
+        'kl_loss': kl_loss_tensor.item(),
+        'total_loss': total_loss_tensor.item()
     }
