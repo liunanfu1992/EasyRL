@@ -1,0 +1,4 @@
+- This is my final project for the "Python Programming" course in the fall semester of 2025.
+- This project uses uv for dependency management.
+- Stable training has now been successfully achieved under single-node multi-GPU conditions.
+- But it's just a final assignment, and there are still many issues with it. For now, don't be too hard on it...
