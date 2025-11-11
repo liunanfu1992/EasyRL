@@ -8,13 +8,13 @@ from easyrl.loss_calculator.grpo_loss_calculator import GRPOLossCalculator
 from transformers import AutoTokenizer
 import torch
 import logging
-import os        
+import os
 import shutil
 
 logger = logging.getLogger(__name__)
 
 class GRPOTrainer:
-    def __init__(self, batch_size: int = 64, epochs: int = 10, rollout_n: int = 8, off_policy_num: int = 1, kl_loss_coeff: float = 0.0, num_gpus: int = 8, forward_size: int = 16, backward_size: int = 4, model_path: str = '/run/determined/workdir/jiayanglyu/model_zoo/Qwen3-4B'):
+    def __init__(self, batch_size: int = 64, epochs: int = 1, rollout_n: int = 8, off_policy_num: int = 1, kl_loss_coeff: float = 0.0, num_gpus: int = 8, forward_size: int = 64, backward_size: int = 16, model_path: str = '/run/determined/workdir/jiayanglyu/model_zoo/Qwen3-8B', checkpoint_save_dir: str = '/run/determined/workdir/jiayanglyu/EasyRL/checkpoint', save_every_n_steps: int = 10):
         self.batch_size = batch_size
         self.epochs = epochs
         self.rollout_n = rollout_n
@@ -25,6 +25,11 @@ class GRPOTrainer:
         self.backward_size = backward_size
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model_path = model_path
+        self.checkpoint_save_dir = checkpoint_save_dir
+        self.save_every_n_steps = save_every_n_steps
+        
+        if checkpoint_save_dir:
+            os.makedirs(checkpoint_save_dir, exist_ok=True)
         
         self.training_data_processor = TrainingDataProcessor(
             data_path='/run/determined/workdir/jiayanglyu/EasyRL/data/rl_train_with_sys_prompt.parquet',
@@ -39,6 +44,8 @@ class GRPOTrainer:
         self.fsdp_backend = None
         self.math_verifier = MathVerifier()
         self.group_advantage_calculator = GroupAdvantageCalculator()
+        
+        
 
     def fit(self):
         curr_index = 0
@@ -72,11 +79,8 @@ class GRPOTrainer:
 
     
             self.inference_engine.sleep_engine()
-            logger.info(f"[Iteration {curr_index}] 推理阶段完成，vLLM已休眠")
             
             all_batch = self.tokenize_and_pad_all_responses(all_batch)
-
-            logger.info(f"[Iteration {curr_index}] 开始训练阶段...")
             
             self.fsdp_backend = FSDPBackend(
                 model_path=self.model_path,
@@ -137,7 +141,7 @@ class GRPOTrainer:
                     batch_labels = all_labels[start_idx:end_idx]
                     batch_advantages = all_advantages[start_idx:end_idx]
                     
-                    new_log_probs, gen_mask = self.fsdp_backend.forward_compute_logprobs(
+                    _ = self.fsdp_backend.forward_compute_logprobs(
                         batch_input_ids,
                         batch_labels,
                         requires_grad=True  
@@ -171,28 +175,18 @@ class GRPOTrainer:
             checkpoint_result = self.fsdp_backend.sleep_backend()
             self.fsdp_backend = None  
 
-            vllm_checkpoint_path, fsdp_checkpoint_path = self.ckpt_temporary_storage(checkpoint_result, vllm_checkpoint_path, fsdp_checkpoint_path)
+            vllm_checkpoint_path, fsdp_checkpoint_path = self.ckpt_temporary_storage(checkpoint_result)
+            
+            # 定期保存checkpoint
+            if self.checkpoint_save_dir and (curr_index + 1) % self.save_every_n_steps == 0:
+                self._save_checkpoint(curr_index + 1, vllm_checkpoint_path)
             
             curr_index += 1
 
-    def ckpt_temporary_storage(self, checkpoint_result, vllm_checkpoint_path, fsdp_checkpoint_path):
+    def ckpt_temporary_storage(self, checkpoint_result):
         if checkpoint_result and checkpoint_result[0] and checkpoint_result[1]:
             new_vllm_checkpoint_path = checkpoint_result[0]  
             new_fsdp_checkpoint_path = checkpoint_result[1]  
-                
-            if vllm_checkpoint_path and vllm_checkpoint_path != new_vllm_checkpoint_path:
-                try:
-                    if os.path.exists(vllm_checkpoint_path) and os.path.isdir(vllm_checkpoint_path):
-                        shutil.rmtree(vllm_checkpoint_path)
-                except Exception as e:
-                    logger.warning(f"Failed to remove old HF checkpoint: {e}")
-                
-            if fsdp_checkpoint_path and fsdp_checkpoint_path != new_fsdp_checkpoint_path:
-                try:
-                    if os.path.exists(fsdp_checkpoint_path):
-                        os.remove(fsdp_checkpoint_path)
-                except Exception as e:
-                    logger.warning(f"Failed to remove old FSDP checkpoint: {e}")
             
             return new_vllm_checkpoint_path, new_fsdp_checkpoint_path
         else: 
@@ -309,6 +303,18 @@ class GRPOTrainer:
                     row['labels'].append(labels)
         
         return all_batch
+    
+    def _save_checkpoint(self, step, vllm_checkpoint_path):
+        checkpoint_name = f"global_step_{step}"
+        save_path = os.path.join(self.checkpoint_save_dir, checkpoint_name)
+        
+        
+        if os.path.exists(vllm_checkpoint_path):
+            if os.path.exists(save_path):
+                shutil.rmtree(save_path)
+            shutil.copytree(vllm_checkpoint_path, save_path)
+        else:
+            logger.error(f"[Step {step}] vLLM checkpoint path does not exist: {vllm_checkpoint_path}")
 
 
 if __name__ == "__main__":
