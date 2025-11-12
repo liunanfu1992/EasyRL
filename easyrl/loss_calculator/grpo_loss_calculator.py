@@ -3,24 +3,23 @@ import torch
 
 
 class GRPOLossCalculator:
-    def __init__(self, low_clip_coffe: float = 0.2, high_clip_coffe: float = 0.2, kl_loss_coeff: float = 0.0):
+    def __init__(self, low_clip_coeff: float = 0.2, high_clip_coeff: float = 0.2, kl_loss_coeff: float = 0.0, traj_batch_size: int = 512):
         self.kl_loss_coeff = kl_loss_coeff
-        self.low_clip_coffe = low_clip_coffe
-        self.high_clip_coffe = high_clip_coffe
-
+        self.low_clip_coeff = low_clip_coeff
+        self.high_clip_coeff = high_clip_coeff
+        self.traj_batch_size = traj_batch_size
+        
     def calculate_policy_loss(self, old_log_probs, new_log_probs, token_level_advantages, gen_mask):
 
         importance_ratio = torch.exp(new_log_probs - old_log_probs)
         unclipped_policy = -token_level_advantages * importance_ratio
-        clipped_policy = -token_level_advantages * torch.clamp(importance_ratio, 1 - self.low_clip_coffe, 1 + self.high_clip_coffe)
+        clipped_policy = -token_level_advantages * torch.clamp(importance_ratio, 1 - self.low_clip_coeff, 1 + self.high_clip_coeff)
         
         token_policy_loss = torch.maximum(unclipped_policy, clipped_policy) 
         mask = gen_mask.to(token_policy_loss.dtype)
         token_policy_loss = token_policy_loss * mask
         
-
-        denom = mask.sum().clamp_min(1.0)
-        policy_loss = token_policy_loss.sum() / denom
+        policy_loss = (token_policy_loss.mean(dim=1) / self.traj_batch_size).sum()
 
         return policy_loss
     
@@ -36,7 +35,7 @@ class GRPOLossCalculator:
         mask = gen_mask.to(token_level_kld.dtype)
         token_level_kld = token_level_kld * mask
 
-        denom = mask.sum().clamp_min(1.0)
-        kld = token_level_kld.sum() / denom
+        kld = (token_level_kld.mean(dim=1) / self.traj_batch_size).sum()
+
         kld = kld * self.kl_loss_coeff  
         return kld
