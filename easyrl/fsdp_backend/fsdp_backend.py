@@ -1,7 +1,6 @@
 import logging
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torch.multiprocessing as mp
 import contextlib
 import os
@@ -24,23 +23,23 @@ _WORKER_TOKENIZER = None
 _WORKER_OPTIMIZER = None
 _WORKER_RANK = None
 _WORKER_DEVICE = None
-_WORKER_ACCUMULATED_LOSS = None
 
 
 class FSDPBackend:
     def __init__(self, model_path: str, learning_rate: float = 1e-5, mixed_precision: bool = True, 
                  sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD, num_processes: int = 8,
-                 cpu_offload: bool = False, checkpoint_dir: str = "/dev/shm", checkpoint_path: str = None):
+                 cpu_offload: bool = False, exchange_path: str = "/dev/shm", checkpoint_path: str = None):
+
         self.model_path = model_path
         self.learning_rate = learning_rate
         self.mixed_precision = mixed_precision
         self.sharding_strategy = sharding_strategy
         self.num_processes = num_processes
         self.cpu_offload = cpu_offload
-        self.checkpoint_dir = checkpoint_dir
+        self.exchange_path = exchange_path
         self.checkpoint_path = checkpoint_path  
         
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(exchange_path, exist_ok=True)
         
         self.mixed_precision_policy = None
         if mixed_precision:
@@ -53,8 +52,6 @@ class FSDPBackend:
         self.request_queue = None
         self.response_queue = None
         self.worker_processes = None
-        
-        logger.info(f"FSDPBackend initialized with {num_processes} processes")
         
         self._start_workers()
 
@@ -79,7 +76,6 @@ class FSDPBackend:
             if status != 'ready':
                 raise RuntimeError(f"Worker initialization failed: {status}")
         
-        logger.info(f"All {self.num_processes} FSDP workers are ready")
 
     def forward_compute_logprobs(self, input_ids_list, labels_list, requires_grad=True):
         self.request_queue.put(('forward', {'input_ids': input_ids_list, 'labels': labels_list, 'requires_grad': requires_grad}))
@@ -90,13 +86,14 @@ class FSDPBackend:
         
         return result
 
-    def backward_step(self, loss_fn, old_log_probs, advantages, is_last_micro_batch, num_accumulation_steps=1):
+    def backward_step(self, loss_fn, old_log_probs, advantages, is_last_micro_batch, num_accumulation_steps=1, traj_batch_size=512):
         self.request_queue.put(('backward', {
             'loss_fn': loss_fn,
             'old_log_probs': old_log_probs,
             'advantages': advantages,
             'is_last': is_last_micro_batch,
-            'num_accumulation_steps': num_accumulation_steps
+            'num_accumulation_steps': num_accumulation_steps,
+            'traj_batch_size': traj_batch_size
         }))
         
         result = self.response_queue.get()
@@ -125,11 +122,10 @@ class FSDPBackend:
 
     def sleep_backend(self):
         checkpoint_path = os.path.join(
-            self.checkpoint_dir,
+            self.exchange_path,
             "fsdp_checkpoint_latest.pt"  
         )
         
-        logger.info(f"FSDP backend shutting down, saving checkpoint to {checkpoint_path}...")
         self.request_queue.put(('save_and_shutdown', checkpoint_path))
         
         hf_checkpoint_dir = None
@@ -180,7 +176,6 @@ class FSDPBackend:
 def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_policy, 
                  sharding_strategy, cpu_offload, request_queue, response_queue, checkpoint_path=None):
     global _WORKER_MODEL, _WORKER_TOKENIZER, _WORKER_OPTIMIZER, _WORKER_RANK, _WORKER_DEVICE
-    global _WORKER_ACCUMULATED_LOSS
     
     try:
         os.environ['RANK'] = str(rank)
@@ -197,16 +192,12 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
         
         _WORKER_DEVICE = torch.device(f"cuda:{rank}")
         _WORKER_RANK = rank
-        _WORKER_ACCUMULATED_LOSS = None
         
         _init_model(model_path, mixed_precision_policy, sharding_strategy, cpu_offload, rank)
         _WORKER_OPTIMIZER = torch.optim.AdamW(_WORKER_MODEL.parameters(), lr=learning_rate)
         
         if checkpoint_path and os.path.exists(checkpoint_path):
-            _load_checkpoint(checkpoint_path, rank)
-        
-        if rank == 0:
-            logger.info(f"Worker {rank} initialized successfully")
+            _load_checkpoint(checkpoint_path)
         
         if rank == 0:
             response_queue.put('ready')
@@ -217,7 +208,6 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                 response_queue.put('ready')
         
         last_forward_result = None  
-        no_sync_context = None
         
         while True:
             if rank == 0:
@@ -230,10 +220,8 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
             task, data = task_data
             
             if task == 'shutdown':
-                logger.info(f"Worker {rank}: Received shutdown signal")
                 dist.barrier()
                 dist.destroy_process_group()
-                logger.info(f"Worker {rank}: Process group destroyed, exiting...")
                 break
             
             elif task == 'forward':
@@ -249,14 +237,14 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                 my_labels = all_labels[start_idx:end_idx]
                 
                 if requires_grad:
-                    my_result = _forward_compute_logprobs(my_input_ids, my_labels, rank)
+                    my_result = _forward_compute_logprobs(my_input_ids, my_labels)
                     last_forward_result = my_result  
                     
                     if rank == 0:
                         response_queue.put((None, None))
                 else:
                     with torch.no_grad():
-                        my_result = _forward_compute_logprobs(my_input_ids, my_labels, rank)
+                        my_result = _forward_compute_logprobs(my_input_ids, my_labels)
                     
                     all_results = [None] * world_size
                     dist.all_gather_object(all_results, my_result)
@@ -290,9 +278,8 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                     my_old_log_probs,
                     my_advantages,
                     data['is_last'],
-                    rank,
-                    no_sync_context,
-                    data.get('num_accumulation_steps', 1)
+                    data.get('num_accumulation_steps', 1),
+                    data.get('traj_batch_size')
                 )
                 
                 if rank == 0:
@@ -345,7 +332,6 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                     
                     safetensors_path = os.path.join(hf_checkpoint_dir, 'model.safetensors')
                     save_file(cleaned_model_state_dict, safetensors_path)
-                    logger.info(f"Worker {rank}: Saved safetensors format to {safetensors_path}")
                     
                     try:
                         config = AutoConfig.from_pretrained(_WORKER_TOKENIZER.name_or_path, trust_remote_code=True)
@@ -361,10 +347,6 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                     }
                     torch.save(checkpoint, optimizer_path)
                     
-                    logger.info(f"Worker {rank}: Saved HuggingFace format to {hf_checkpoint_dir}")
-                    logger.info(f"Worker {rank}: Saved full checkpoint (with optimizer) to {optimizer_path}")
-                    
-                  
                     response_queue.put(('saved', hf_checkpoint_dir, optimizer_path))
                     del full_model_state_dict, full_optimizer_state_dict, cleaned_model_state_dict, checkpoint
                 else:
@@ -372,10 +354,7 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                 
                 dist.barrier()
                 
-
-                logger.info(f"Worker {rank}: Destroying process group...")
                 dist.destroy_process_group()
-                logger.info(f"Worker {rank}: Process group destroyed, exiting...")
                 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -392,18 +371,13 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
         raise
 
 
-def _load_checkpoint(checkpoint_path, rank):
-    global _WORKER_MODEL, _WORKER_OPTIMIZER
-    
-    if rank == 0:
-        logger.info(f"Loading checkpoint from {checkpoint_path}")
-    
+def _load_checkpoint(checkpoint_path):
+    global _WORKER_MODEL, _WORKER_OPTIMIZER   
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
     if 'model_state_dict' in checkpoint:
         model_state_dict = checkpoint['model_state_dict']
         
-
         wrapped_state_dict = {}
         for k, v in model_state_dict.items():
             if not k.startswith('_fsdp_wrapped_module.'):
@@ -412,9 +386,6 @@ def _load_checkpoint(checkpoint_path, rank):
                 wrapped_state_dict[k] = v
         
         _WORKER_MODEL.load_state_dict(wrapped_state_dict, strict=False)
-        
-        if rank == 0:
-            logger.info(f"Loaded {len(model_state_dict)} model parameters from checkpoint")
     
     if 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
         full_optimizer_state_dict = checkpoint['optimizer_state_dict']
@@ -423,14 +394,9 @@ def _load_checkpoint(checkpoint_path, rank):
             _WORKER_MODEL
         )
         _WORKER_OPTIMIZER.load_state_dict(sharded_optimizer_state_dict)
-        if rank == 0:
-            logger.info("Loaded optimizer state from checkpoint")
     
     del checkpoint
     
-    if rank == 0:
-        logger.info("Checkpoint loaded successfully")
-
 
 def _init_model(model_path, mixed_precision_policy, sharding_strategy, cpu_offload, rank):
     global _WORKER_MODEL, _WORKER_TOKENIZER
@@ -451,8 +417,6 @@ def _init_model(model_path, mixed_precision_policy, sharding_strategy, cpu_offlo
     
     if hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable()
-        if rank == 0:
-            logger.info("Gradient checkpointing enabled")
     
     transformer_layer_cls_names = getattr(model, "_no_split_modules", None)
     transformer_cls_to_wrap = set()
@@ -477,8 +441,6 @@ def _init_model(model_path, mixed_precision_policy, sharding_strategy, cpu_offlo
     cpu_offload_policy = None
     if cpu_offload:
         cpu_offload_policy = CPUOffload(offload_params=True)
-        if rank == 0:
-            logger.info("CPU offload enabled for parameters")
     
     _WORKER_MODEL = FSDP(
         model,
@@ -493,7 +455,7 @@ def _init_model(model_path, mixed_precision_policy, sharding_strategy, cpu_offlo
     )
 
 
-def _forward_compute_logprobs(input_ids_list, labels_list, rank):
+def _forward_compute_logprobs(input_ids_list, labels_list):
     global _WORKER_MODEL, _WORKER_TOKENIZER, _WORKER_DEVICE
     
     device = _WORKER_DEVICE
@@ -537,7 +499,7 @@ def _forward_compute_logprobs(input_ids_list, labels_list, rank):
     }
 
 
-def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is_last, rank, no_sync_context, num_accumulation_steps=1):
+def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is_last, num_accumulation_steps=1, traj_batch_size=512):
     global _WORKER_MODEL
     
     new_log_probs = forward_result['token_logprobs']
@@ -555,9 +517,10 @@ def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is
     high_clip = loss_fn_config.get('high_clip_coeff', 0.2)
     
     loss_calculator = GRPOLossCalculator(
-        low_clip_coffe=low_clip,
-        high_clip_coffe=high_clip,
-        kl_loss_coeff=kl_coeff
+        low_clip_coeff=low_clip,
+        high_clip_coeff=high_clip,
+        kl_loss_coeff=kl_coeff,
+        traj_batch_size=traj_batch_size
     )
 
     policy_loss = loss_calculator.calculate_policy_loss(
