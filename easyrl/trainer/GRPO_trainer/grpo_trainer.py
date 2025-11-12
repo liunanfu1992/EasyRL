@@ -161,7 +161,8 @@ class GRPOTrainer:
                         old_log_probs=old_log_probs_batch,
                         advantages=advantages,
                         is_last_micro_batch=is_last,
-                        num_accumulation_steps=num_steps
+                        num_accumulation_steps=num_steps,
+                        traj_batch_size= self.batch_size * self.rollout_n
                     )
                     
                     logger.info(f"Epoch {curr_index} - Batch {batch_idx} - Step {step_idx}/{num_steps} - "
