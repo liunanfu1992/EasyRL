@@ -12,10 +12,10 @@ class GRPOLossCalculator:
     def calculate_policy_loss(self, old_log_probs, new_log_probs, token_level_advantages, gen_mask):
 
         importance_ratio = torch.exp(new_log_probs - old_log_probs)
-        unclipped_policy = -token_level_advantages * importance_ratio
-        clipped_policy = -token_level_advantages * torch.clamp(importance_ratio, 1 - self.low_clip_coeff, 1 + self.high_clip_coeff)
+        unclipped_policy = token_level_advantages * importance_ratio
+        clipped_policy = token_level_advantages * torch.clamp(importance_ratio, 1 - self.low_clip_coeff, 1 + self.high_clip_coeff)
         
-        token_policy_loss = torch.maximum(unclipped_policy, clipped_policy) 
+        token_policy_loss = -torch.minimum(unclipped_policy, clipped_policy) 
         mask = gen_mask.to(token_policy_loss.dtype)
         token_policy_loss = token_policy_loss * mask
         
