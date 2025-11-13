@@ -5,11 +5,13 @@ from easyrl.reward_verifier.math_verifier import MathVerifier
 from easyrl.advantage_calculator.group_advantage_calculator import GroupAdvantageCalculator
 from easyrl.fsdp_backend.fsdp_backend import FSDPBackend
 from easyrl.loss_calculator.grpo_loss_calculator import GRPOLossCalculator
+from easyrl.indicator_monitor.indicator_monitor import IndicatorMonitor
 from transformers import AutoTokenizer
 import torch
 import logging
 import os
 import shutil
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -44,146 +46,178 @@ class GRPOTrainer:
         self.fsdp_backend = None
         self.math_verifier = MathVerifier()
         self.group_advantage_calculator = GroupAdvantageCalculator()
+        self.indicator_monitor = IndicatorMonitor(
+            log_dir='/run/determined/workdir/jiayanglyu/EasyRL/logs',
+            project_name='GRPO_trainer_test',
+            experiment_name='test_1'
+        )
         
         
-
+    
     def fit(self):
         curr_index = 0
         fsdp_checkpoint_path = None  
         vllm_checkpoint_path = None 
+        try:
+            while True: 
+                if self.inference_engine is None:
+                    self.inference_engine = InferenceEngine(
+                        model_path=self.model_path,
+                        rollout_n=self.rollout_n
+                    )
+            
+                self.inference_engine.wake_up_engine(vllm_checkpoint_path)
+
+                if curr_index % 10 == 0:
+                    validation_group = self.validation_data_processor.get_validation_group()
+                    validation_group = self.submit_validation_task_to_inference_engine(validation_group)
+                    validation_group = self.verify_validation_answer(validation_group)
+                    result_info = self._statistical_validation_results(validation_group)
+                    self.indicator_monitor.log_validation_results(result_info, curr_index)
+
+                
+
+                all_batch = []
+                for _ in range(self.off_policy_num):
+                    all_batch.append(self.training_data_processor.get_next_batch())
+                
+                for curr_batch in all_batch:
+                    curr_batch = self.submit_training_task_to_inference_engine(curr_batch)
+                    curr_batch = self.verify_training_answer(curr_batch)
+                    curr_batch = self.compute_advantage(curr_batch)
+
         
-        while True:
-            
-            if self.inference_engine is None:
-                self.inference_engine = InferenceEngine(
+                self.inference_engine.sleep_engine()
+                
+                all_batch = self.tokenize_and_pad_all_responses(all_batch)
+                
+                self.fsdp_backend = FSDPBackend(
                     model_path=self.model_path,
-                    rollout_n=self.rollout_n
+                    num_processes=self.num_gpus,
+                    learning_rate=1e-6,
+                    cpu_offload=True,
+                    checkpoint_path=fsdp_checkpoint_path  
                 )
-            
-            self.inference_engine.wake_up_engine(vllm_checkpoint_path)
 
-            if curr_index % 10 == 0:
-                validation_group = self.validation_data_processor.get_validation_group()
-                validation_group = self.submit_validation_task_to_inference_engine(validation_group)
-                validation_group = self.verify_validation_answer(validation_group)
-            
-
-            all_batch = []
-            for _ in range(self.off_policy_num):
-                all_batch.append(self.training_data_processor.get_next_batch())
-            
-            for curr_batch in all_batch:
-                curr_batch = self.submit_training_task_to_inference_engine(curr_batch)
-                curr_batch = self.verify_training_answer(curr_batch)
-                curr_batch = self.compute_advantage(curr_batch)
-
-    
-            self.inference_engine.sleep_engine()
-            
-            all_batch = self.tokenize_and_pad_all_responses(all_batch)
-            
-            self.fsdp_backend = FSDPBackend(
-                model_path=self.model_path,
-                num_processes=self.num_gpus,
-                learning_rate=1e-6,
-                cpu_offload=True,
-                checkpoint_path=fsdp_checkpoint_path  
-            )
-
-    
-            old_log_probs_list = []
-            for curr_batch in all_batch:
-                all_input_ids = []
-                all_labels = []
-                for row in curr_batch:
-                    for i in range(len(row['input_ids'])):
-                        all_input_ids.append(row['input_ids'][i])
-                        all_labels.append(row['labels'][i])
+        
+                old_log_probs_list = []
+                for curr_batch in all_batch:
+                    all_input_ids = []
+                    all_labels = []
+                    for row in curr_batch:
+                        for i in range(len(row['input_ids'])):
+                            all_input_ids.append(row['input_ids'][i])
+                            all_labels.append(row['labels'][i])
+                    
+                    total_responses = len(all_input_ids)
+                    all_old_log_probs = []
+                    
+                    for start_idx in range(0, total_responses, self.forward_size):
+                        end_idx = start_idx + self.forward_size
+                        batch_input_ids = all_input_ids[start_idx:end_idx]
+                        batch_labels = all_labels[start_idx:end_idx]
+                        
+                        old_log_probs_batch, _ = self.fsdp_backend.forward_compute_logprobs(
+                            batch_input_ids,
+                            batch_labels,
+                            requires_grad=False  
+                        )
+                        all_old_log_probs.append(old_log_probs_batch.cpu())
+                    
+                    old_log_probs_list.append(all_old_log_probs)
                 
-                total_responses = len(all_input_ids)
-                all_old_log_probs = []
-                
-                for start_idx in range(0, total_responses, self.forward_size):
-                    end_idx = start_idx + self.forward_size
-                    batch_input_ids = all_input_ids[start_idx:end_idx]
-                    batch_labels = all_labels[start_idx:end_idx]
+                for batch_idx, curr_batch in enumerate(all_batch):
+                    self.fsdp_backend.set_train_mode()
+                    self.fsdp_backend.zero_grad()
                     
-                    old_log_probs_batch, _ = self.fsdp_backend.forward_compute_logprobs(
-                        batch_input_ids,
-                        batch_labels,
-                        requires_grad=False  
-                    )
-                    all_old_log_probs.append(old_log_probs_batch.cpu())
-                
-                old_log_probs_list.append(all_old_log_probs)
+                    all_input_ids = []
+                    all_labels = []
+                    all_advantages = []
+                    for row in curr_batch:
+                        for i in range(len(row['input_ids'])):
+                            all_input_ids.append(row['input_ids'][i])
+                            all_labels.append(row['labels'][i])
+                            all_advantages.append(row['advantage'][i])
+                    
+                    total_responses = len(all_input_ids)
+                    num_steps = total_responses // self.backward_size
+
+                    sum_loss_info = {
+                        'policy_loss': 0.0,
+                        'kl_loss': 0.0,
+                        'total_loss': 0.0
+                    }
+                    
+                    for step_idx in range(num_steps):
+                        start_idx = step_idx * self.backward_size
+                        end_idx = start_idx + self.backward_size
+                        
+                        batch_input_ids = all_input_ids[start_idx:end_idx]
+                        batch_labels = all_labels[start_idx:end_idx]
+                        batch_advantages = all_advantages[start_idx:end_idx]
+                        
+                        _ = self.fsdp_backend.forward_compute_logprobs(
+                            batch_input_ids,
+                            batch_labels,
+                            requires_grad=True  
+                        )
+
+                        advantages = torch.tensor(batch_advantages, dtype=torch.float32)
+                        
+                        forward_batch_idx = start_idx // self.forward_size
+                        offset_in_forward_batch = start_idx % self.forward_size
+                        
+                        old_log_probs_batch = old_log_probs_list[batch_idx][forward_batch_idx][offset_in_forward_batch:offset_in_forward_batch + (end_idx - start_idx)]
+                        
+                        is_last = (step_idx == num_steps - 1)
+                        
+                        loss_info = self.fsdp_backend.backward_step(
+                            loss_fn={'type': 'grpo', 'kl_coeff': self.kl_loss_coeff, 'low_clip_coeff': 0.2, 'high_clip_coeff': 0.2},
+                            old_log_probs=old_log_probs_batch,
+                            advantages=advantages,
+                            is_last_micro_batch=is_last,
+                            num_accumulation_steps=num_steps,
+                            traj_batch_size= self.batch_size * self.rollout_n
+                        )
+
+                        sum_loss_info['policy_loss'] += loss_info['policy_loss']
+                        sum_loss_info['kl_loss'] += loss_info['kl_loss']
+                        sum_loss_info['total_loss'] += loss_info['total_loss']
+                    
+                    self.fsdp_backend.update_model()
+                    curr_index += 1
+
+                    self.indicator_monitor.log_losses(sum_loss_info, curr_index)
+
+                    training_result_info = self._statistical_training_results(curr_batch)
+                    self.indicator_monitor.log_training_reward(training_result_info, curr_index)
+
+
+                    checkpoint_result = self.fsdp_backend.sleep_backend()
+                    self.fsdp_backend = None  
+
+                    vllm_checkpoint_path, fsdp_checkpoint_path = self.ckpt_temporary_storage(checkpoint_result)
+                    
+                    if self.checkpoint_save_dir and curr_index % self.save_every_n_steps == 0:
+                        self._save_checkpoint(curr_index, vllm_checkpoint_path)
+                    
+                    if batch_idx != len(all_batch) - 1:
+                        self.fsdp_backend = FSDPBackend(
+                            model_path=self.model_path,
+                            num_processes=self.num_gpus,
+                            learning_rate=1e-6,
+                            cpu_offload=True,
+                            checkpoint_path=fsdp_checkpoint_path  
+                        )
+                        
+        except StopIteration:
+            logger.info(f"Training is completed, total steps: {curr_index}")
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            raise e
+        finally:
+            self.indicator_monitor.close()
             
-            for batch_idx, curr_batch in enumerate(all_batch):
-                self.fsdp_backend.set_train_mode()
-                self.fsdp_backend.zero_grad()
-                
-                all_input_ids = []
-                all_labels = []
-                all_advantages = []
-                for row in curr_batch:
-                    for i in range(len(row['input_ids'])):
-                        all_input_ids.append(row['input_ids'][i])
-                        all_labels.append(row['labels'][i])
-                        all_advantages.append(row['advantage'][i])
-                
-                total_responses = len(all_input_ids)
-                num_steps = total_responses // self.backward_size
-                
-                for step_idx in range(num_steps):
-                    start_idx = step_idx * self.backward_size
-                    end_idx = start_idx + self.backward_size
-                    
-                    batch_input_ids = all_input_ids[start_idx:end_idx]
-                    batch_labels = all_labels[start_idx:end_idx]
-                    batch_advantages = all_advantages[start_idx:end_idx]
-                    
-                    _ = self.fsdp_backend.forward_compute_logprobs(
-                        batch_input_ids,
-                        batch_labels,
-                        requires_grad=True  
-                    )
-
-                    advantages = torch.tensor(batch_advantages, dtype=torch.float32)
-                    
-                    forward_batch_idx = start_idx // self.forward_size
-                    offset_in_forward_batch = start_idx % self.forward_size
-                    
-                    old_log_probs_batch = old_log_probs_list[batch_idx][forward_batch_idx][offset_in_forward_batch:offset_in_forward_batch + (end_idx - start_idx)]
-                    
-                    is_last = (step_idx == num_steps - 1)
-                    
-                    loss_info = self.fsdp_backend.backward_step(
-                        loss_fn={'type': 'grpo', 'kl_coeff': self.kl_loss_coeff, 'low_clip_coeff': 0.2, 'high_clip_coeff': 0.2},
-                        old_log_probs=old_log_probs_batch,
-                        advantages=advantages,
-                        is_last_micro_batch=is_last,
-                        num_accumulation_steps=num_steps,
-                        traj_batch_size= self.batch_size * self.rollout_n
-                    )
-                    
-                    logger.info(f"Epoch {curr_index} - Batch {batch_idx} - Step {step_idx}/{num_steps} - "
-                              f"Responses [{start_idx}:{end_idx}] - "
-                              f"Policy Loss: {loss_info['policy_loss']:.4f}, "
-                              f"KL Loss: {loss_info['kl_loss']:.4f}, "
-                              f"Total Loss: {loss_info['total_loss']:.4f}")
-                
-                self.fsdp_backend.update_model()
-
-            checkpoint_result = self.fsdp_backend.sleep_backend()
-            self.fsdp_backend = None  
-
-            vllm_checkpoint_path, fsdp_checkpoint_path = self.ckpt_temporary_storage(checkpoint_result)
-            
-            # 定期保存checkpoint
-            if self.checkpoint_save_dir and (curr_index + 1) % self.save_every_n_steps == 0:
-                self._save_checkpoint(curr_index + 1, vllm_checkpoint_path)
-            
-            curr_index += 1
-
     def ckpt_temporary_storage(self, checkpoint_result):
         if checkpoint_result and checkpoint_result[0] and checkpoint_result[1]:
             new_vllm_checkpoint_path = checkpoint_result[0]  
@@ -234,6 +268,56 @@ class GRPOTrainer:
                 idx += 1
 
         return validation_group
+    
+    def _statistical_validation_results(self, validation_group):
+        result_info = {}
+
+        for group_name in validation_group.keys():
+            group = validation_group[group_name]
+
+            if group['pass_k_num'] == 1:
+                result_info[group_name] = {'mean': 0.0, 'std': 0.0}
+                reward_list = []
+
+                for row in group['content']:
+                    reward_list.append(row['reward'])
+
+                result_info[group_name]['mean'] = np.mean(reward_list)
+                result_info[group_name]['std'] = np.std(reward_list)
+
+            else:
+                # TODO: Implement best@N evaluation
+                result_info[group_name] = {'mean': 0.0, 'std': 0.0}
+                reward_list = []
+
+                for row in group['content']:
+                    reward_list.append(row['reward'])
+                
+                result_info[group_name]['mean'] = np.mean(reward_list)
+                result_info[group_name]['std'] = np.std(reward_list)
+
+        return result_info
+    
+    def _statistical_training_results(self, training_batch):
+        result_info = {}
+
+        reward_list = []
+        advantage_list = []
+
+        for row in training_batch:
+            reward_list.extend(row['reward'])
+            advantage_list.extend(row['advantage'])
+
+        result_info['reward'] = {
+            'mean': np.mean(reward_list),
+            'std': np.std(reward_list)
+        }
+        result_info['advantage'] = {
+            'mean': np.mean(advantage_list),
+            'std': np.std(advantage_list)
+        }
+
+        return result_info
 
     def verify_training_answer(self, training_batch):
         judge_list = []
@@ -316,6 +400,7 @@ class GRPOTrainer:
             shutil.copytree(vllm_checkpoint_path, save_path)
         else:
             logger.error(f"[Step {step}] vLLM checkpoint path does not exist: {vllm_checkpoint_path}")
+    
 
 
 if __name__ == "__main__":
