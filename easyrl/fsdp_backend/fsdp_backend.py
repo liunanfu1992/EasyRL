@@ -539,7 +539,7 @@ def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is
     else:
         kl_loss = torch.tensor(0.0, device=device)
     
-    total_loss = (policy_loss + kl_loss) / num_accumulation_steps
+    total_loss = policy_loss + kl_loss
     
     if is_last:
         total_loss.backward()
@@ -551,9 +551,9 @@ def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is
     kl_loss_tensor = torch.tensor(kl_loss.item(), device=device)
     total_loss_tensor = torch.tensor(total_loss.item(), device=device)
 
-    dist.all_reduce(policy_loss_tensor, op=dist.ReduceOp.AVG)
-    dist.all_reduce(kl_loss_tensor, op=dist.ReduceOp.AVG)
-    dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.AVG)
+    dist.all_reduce(policy_loss_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(kl_loss_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
     
     return {
         'policy_loss': policy_loss_tensor.item(),
