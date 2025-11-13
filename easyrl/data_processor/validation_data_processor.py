@@ -21,7 +21,7 @@ class ValidationDataProcessor:
             group = f"{row.extra_info['data_source']}/pass@{row.extra_info['pass@k']}"
             if group not in validation_group:
                 validation_group[group] = {}
-                validation_group[group]['pass_k_flag'] = False if row.extra_info['pass@k'] == 1 else True
+                validation_group[group]['pass_k_num'] = row.extra_info['pass@k'] 
                 validation_group[group]['content'] = []
            
             row_information = {}
@@ -37,6 +37,8 @@ class ValidationDataProcessor:
             
     def get_validation_group(self) -> Dict[str, Dict[str, Any]]:
         return self.validation_group
+    
+    
             
             
 
