@@ -1,7 +1,5 @@
 import torch
 
-
-
 class GRPOLossCalculator:
     def __init__(self, low_clip_coeff: float = 0.2, high_clip_coeff: float = 0.2, kl_loss_coeff: float = 0.0, traj_batch_size: int = 512):
         self.kl_loss_coeff = kl_loss_coeff
@@ -18,9 +16,9 @@ class GRPOLossCalculator:
         token_policy_loss = -torch.minimum(unclipped_policy, clipped_policy) 
         mask = gen_mask.to(token_policy_loss.dtype)
         token_policy_loss = token_policy_loss * mask
-        
-        policy_loss = (token_policy_loss.mean(dim=1) / self.traj_batch_size).sum()
 
+        policy_loss = (token_policy_loss.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)).sum() / self.traj_batch_size
+        
         return policy_loss
     
     def calculate_kl_loss(self, old_log_probs, new_log_probs, gen_mask):
