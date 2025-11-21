@@ -86,13 +86,12 @@ class FSDPBackend:
         
         return result
 
-    def backward_step(self, loss_fn, old_log_probs, advantages, is_last_micro_batch, num_accumulation_steps=1, traj_batch_size=512):
+    def backward_step(self, loss_fn, old_log_probs, advantages, is_last_micro_batch, traj_batch_size=512):
         self.request_queue.put(('backward', {
             'loss_fn': loss_fn,
             'old_log_probs': old_log_probs,
             'advantages': advantages,
             'is_last': is_last_micro_batch,
-            'num_accumulation_steps': num_accumulation_steps,
             'traj_batch_size': traj_batch_size
         }))
         
@@ -278,7 +277,6 @@ def _worker_main(rank, world_size, model_path, learning_rate, mixed_precision_po
                     my_old_log_probs,
                     my_advantages,
                     data['is_last'],
-                    data.get('num_accumulation_steps', 1),
                     data.get('traj_batch_size')
                 )
                 
@@ -499,7 +497,7 @@ def _forward_compute_logprobs(input_ids_list, labels_list):
     }
 
 
-def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is_last, num_accumulation_steps=1, traj_batch_size=512):
+def _backward_step(forward_result, loss_fn_config, old_log_probs, advantages, is_last, traj_batch_size=512):
     global _WORKER_MODEL
     
     new_log_probs = forward_result['token_logprobs']
