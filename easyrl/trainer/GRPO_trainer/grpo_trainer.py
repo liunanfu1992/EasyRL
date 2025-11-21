@@ -16,7 +16,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 class GRPOTrainer:
-    def __init__(self, batch_size: int = 64, epochs: int = 1, rollout_n: int = 8, off_policy_num: int = 1, kl_loss_coeff: float = 0.0, num_gpus: int = 8, forward_size: int = 64, backward_size: int = 16, model_path: str = '/run/determined/workdir/jiayanglyu/model_zoo/Qwen3-8B', checkpoint_save_dir: str = '/run/determined/workdir/jiayanglyu/EasyRL/checkpoint', save_every_n_steps: int = 10):
+    def __init__(self, batch_size: int = 64, epochs: int = 1, rollout_n: int = 8, off_policy_num: int = 1, kl_loss_coeff: float = 0.0, num_gpus: int = 8, forward_size: int = 64, backward_size: int = 16, model_path: str = '/run/determined/workdir/jiayanglyu/model_zoo/Qwen2.5-7B', checkpoint_save_dir: str = '/run/determined/workdir/jiayanglyu/EasyRL/checkpoint', save_every_n_steps: int = 10):
         self.batch_size = batch_size
         self.epochs = epochs
         self.rollout_n = rollout_n
@@ -49,7 +49,7 @@ class GRPOTrainer:
         self.indicator_monitor = IndicatorMonitor(
             log_dir='/run/determined/workdir/jiayanglyu/EasyRL/logs',
             project_name='GRPO_trainer_test',
-            experiment_name='test_1'
+            experiment_name='test'
         )
         
         
@@ -176,8 +176,7 @@ class GRPOTrainer:
                             old_log_probs=old_log_probs_batch,
                             advantages=advantages,
                             is_last_micro_batch=is_last,
-                            num_accumulation_steps=num_steps,
-                            traj_batch_size= self.batch_size * self.rollout_n
+                            traj_batch_size= self.batch_size * self.rollout_n // self.num_gpus
                         )
 
                         sum_loss_info['policy_loss'] += loss_info['policy_loss']
