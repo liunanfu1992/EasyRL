@@ -4,42 +4,67 @@ from easyrl.inference_engine.inference_engine import InferenceEngine
 from easyrl.reward_verifier.math_verifier import MathVerifier
 from easyrl.advantage_calculator.group_advantage_calculator import GroupAdvantageCalculator
 from easyrl.fsdp_backend.fsdp_backend import FSDPBackend
-from easyrl.loss_calculator.grpo_loss_calculator import GRPOLossCalculator
 from easyrl.indicator_monitor.indicator_monitor import IndicatorMonitor
+from omegaconf import DictConfig
 from transformers import AutoTokenizer
 import torch
 import logging
 import os
 import shutil
+import hydra
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 class GRPOTrainer:
-    def __init__(self, batch_size: int = 64, epochs: int = 1, rollout_n: int = 8, off_policy_num: int = 1, kl_loss_coeff: float = 0.0, num_gpus: int = 8, forward_size: int = 64, backward_size: int = 16, model_path: str = '/run/determined/workdir/jiayanglyu/model_zoo/Qwen2.5-7B', checkpoint_save_dir: str = '/run/determined/workdir/jiayanglyu/EasyRL/checkpoint', save_every_n_steps: int = 10):
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.rollout_n = rollout_n
-        self.off_policy_num = off_policy_num
-        self.kl_loss_coeff = kl_loss_coeff
-        self.num_gpus = num_gpus
-        self.forward_size = forward_size
-        self.backward_size = backward_size
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.model_path = model_path
-        self.checkpoint_save_dir = checkpoint_save_dir
-        self.save_every_n_steps = save_every_n_steps
+    def __init__(self, cfg: DictConfig):
+        self.num_gpus = cfg.actor.num_gpus
+        self.rollout_n = cfg.actor.rollout_n
+        self.save_every_n_steps = cfg.actor.save_every_n_steps
+
+        self.batch_size = cfg.actor.training.batch_size
+        self.epochs = cfg.actor.training.epochs
+        self.off_policy_num = cfg.actor.training.off_policy_num
+        self.kl_loss_coeff = cfg.actor.training.kl_loss_coeff
+        self.forward_size = cfg.actor.training.forward_size
+        self.backward_size = cfg.actor.training.backward_size
+        self.learning_rate = cfg.actor.training.learning_rate
+        self.cpu_offload = cfg.actor.training.cpu_offload
+        self.mixed_precision = cfg.actor.training.mixed_precision
+ 
+        self.train_temperature = cfg.actor.inference.train_temperature
+        self.train_top_p = cfg.actor.inference.train_top_p
+        self.train_top_k = cfg.actor.inference.train_top_k
+        self.valid_temperature = cfg.actor.inference.valid_temperature
+        self.valid_top_p = cfg.actor.inference.valid_top_p
+        self.valid_top_k = cfg.actor.inference.valid_top_k
+        self.max_tokens = cfg.actor.inference.max_tokens
+        self.gpu_memory_utilization = cfg.actor.inference.gpu_memory_utilization
+        self.tensor_parallel_size = cfg.actor.inference.tensor_parallel_size
+        self.pipeline_parallel_size = cfg.actor.inference.pipeline_parallel_size
+
+        self.model_path = cfg.paths.model_path
+        self.checkpoint_save_dir = cfg.paths.checkpoint_dir
+        self.train_data_path = cfg.paths.train_data
+        self.valid_data_path = cfg.paths.valid_data
+        self.exchange_path = cfg.paths.exchange_path
+
+        self.monitor_log_dir = cfg.monitor.log_dir
+        self.monitor_project_name = cfg.monitor.project_name
+        self.monitor_experiment_name = cfg.monitor.experiment_name
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
         
-        if checkpoint_save_dir:
-            os.makedirs(checkpoint_save_dir, exist_ok=True)
+        if self.checkpoint_save_dir:
+            os.makedirs(self.checkpoint_save_dir, exist_ok=True)
         
         self.training_data_processor = TrainingDataProcessor(
-            data_path='/run/determined/workdir/jiayanglyu/EasyRL/data/rl_train_with_sys_prompt.parquet',
+            data_path=self.train_data_path,
             batch_size=self.batch_size,
             epochs=self.epochs
         )
         self.validation_data_processor = ValidationDataProcessor(
-            data_path='/run/determined/workdir/jiayanglyu/EasyRL/data/rl_valid_with_sys_prompt.parquet'
+            data_path=self.valid_data_path
         )
 
         self.inference_engine = None
@@ -47,9 +72,9 @@ class GRPOTrainer:
         self.math_verifier = MathVerifier()
         self.group_advantage_calculator = GroupAdvantageCalculator()
         self.indicator_monitor = IndicatorMonitor(
-            log_dir='/run/determined/workdir/jiayanglyu/EasyRL/logs',
-            project_name='GRPO_trainer_test',
-            experiment_name='test'
+            log_dir=self.monitor_log_dir,
+            project_name=self.monitor_project_name,
+            experiment_name=self.monitor_experiment_name
         )
         
         
@@ -63,7 +88,17 @@ class GRPOTrainer:
                 if self.inference_engine is None:
                     self.inference_engine = InferenceEngine(
                         model_path=self.model_path,
-                        rollout_n=self.rollout_n
+                        rollout_n=self.rollout_n,
+                        tensor_parallel_size=self.tensor_parallel_size,
+                        pipeline_parallel_size=self.pipeline_parallel_size,
+                        train_temperature=self.train_temperature,
+                        train_top_p=self.train_top_p,
+                        train_top_k=self.train_top_k,
+                        valid_temperature=self.valid_temperature,
+                        valid_top_p=self.valid_top_p,
+                        valid_top_k=self.valid_top_k,
+                        max_tokens=self.max_tokens,
+                        gpu_memory_utilization=self.gpu_memory_utilization,
                     )
             
                 self.inference_engine.wake_up_engine(vllm_checkpoint_path)
@@ -94,8 +129,10 @@ class GRPOTrainer:
                 self.fsdp_backend = FSDPBackend(
                     model_path=self.model_path,
                     num_processes=self.num_gpus,
-                    learning_rate=1e-6,
-                    cpu_offload=True,
+                    learning_rate=self.learning_rate,
+                    cpu_offload=self.cpu_offload,
+                    mixed_precision=self.mixed_precision,
+                    exchange_path=self.exchange_path,
                     checkpoint_path=fsdp_checkpoint_path  
                 )
 
@@ -204,8 +241,10 @@ class GRPOTrainer:
                         self.fsdp_backend = FSDPBackend(
                             model_path=self.model_path,
                             num_processes=self.num_gpus,
-                            learning_rate=1e-6,
-                            cpu_offload=True,
+                            learning_rate=self.learning_rate,
+                            cpu_offload=self.cpu_offload,
+                            mixed_precision=self.mixed_precision,
+                            exchange_path=self.exchange_path,
                             checkpoint_path=fsdp_checkpoint_path  
                         )
                         
@@ -399,9 +438,11 @@ class GRPOTrainer:
             shutil.copytree(vllm_checkpoint_path, save_path)
         else:
             logger.error(f"[Step {step}] vLLM checkpoint path does not exist: {vllm_checkpoint_path}")
-    
 
+@hydra.main(version_base=None, config_name="grpo", config_path="config")
+def main(cfg: DictConfig):
+    trainer = GRPOTrainer(cfg)
+    trainer.fit()
 
 if __name__ == "__main__":
-    grpo_trainer = GRPOTrainer()
-    grpo_trainer.fit()
+    main()

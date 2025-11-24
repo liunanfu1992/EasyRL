@@ -26,9 +26,9 @@ _WORKER_DEVICE = None
 
 
 class FSDPBackend:
-    def __init__(self, model_path: str, learning_rate: float = 1e-5, mixed_precision: bool = True, 
-                 sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD, num_processes: int = 8,
-                 cpu_offload: bool = False, exchange_path: str = "/dev/shm", checkpoint_path: str = None):
+    def __init__(self, model_path: str, learning_rate: float, mixed_precision: bool, num_processes: int,
+                 cpu_offload: bool, exchange_path: str, checkpoint_path: str,
+                 sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD):
 
         self.model_path = model_path
         self.learning_rate = learning_rate

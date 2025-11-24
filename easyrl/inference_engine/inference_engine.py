@@ -77,16 +77,20 @@ class InferenceEngine:
     def __init__(
         self,
         model_path: str,
-        tensor_parallel_size: int = 8,
-        pipeline_parallel_size: int = 1,
-        temperature: float = 0.6,
-        top_p: float = 0.95,
-        max_tokens: int = 4096, 
-        gpu_memory_utilization: float = 0.8,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+        train_temperature: float,
+        train_top_p: float,
+        train_top_k: int,
+        valid_temperature: float,
+        valid_top_p: float,
+        valid_top_k: int,
+        max_tokens: int, 
+        gpu_memory_utilization: float,
+        rollout_n: int, 
         trust_remote_code: bool = True,
         dtype: str = 'auto',
         max_num_seqs: int = 512,
-        rollout_n: int = 8, 
         load_first_from_local: bool = True,
     ):
 
@@ -94,8 +98,12 @@ class InferenceEngine:
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
-        self.temperature = temperature
-        self.top_p = top_p
+        self.train_temperature = train_temperature
+        self.train_top_p = train_top_p
+        self.train_top_k = train_top_k
+        self.valid_temperature = valid_temperature
+        self.valid_top_p = valid_top_p
+        self.valid_top_k = valid_top_k
         self.max_tokens = max_tokens
         self.gpu_memory_utilization = gpu_memory_utilization
         self.trust_remote_code = trust_remote_code
@@ -153,16 +161,18 @@ class InferenceEngine:
 
     def _initialize_training_sampling_params(self):
         return SamplingParams(
-            temperature=self.temperature,
-            top_p=self.top_p,
+            temperature=self.train_temperature,
+            top_p=self.train_top_p,
+            top_k=self.train_top_k,
             max_tokens=self.max_tokens,
             n=self.rollout_n
         )
 
     def _initialize_validation_sampling_params(self):
         return SamplingParams(
-            temperature=self.temperature,
-            top_p=self.top_p,
+            temperature=self.valid_temperature,
+            top_p=self.valid_top_p,
+            top_k=self.valid_top_k,
             max_tokens=self.max_tokens,
             n=1
         )

@@ -1,0 +1,39 @@
+paths:
+  model_path: "/run/determined/workdir/jiayanglyu/model_zoo/Qwen2.5-7B"
+  train_data: "/run/determined/workdir/jiayanglyu/EasyRL/data/rl_train_with_sys_prompt.parquet"
+  valid_data: "/run/determined/workdir/jiayanglyu/EasyRL/data/rl_valid_with_sys_prompt.parquet"
+  checkpoint_dir: "/run/determined/workdir/jiayanglyu/EasyRL/checkpoint"
+  exchange_path: "/dev/shm"
+
+actor:
+  num_gpus: 8
+  rollout_n: 8
+  save_every_n_steps: 10
+
+  training:
+    batch_size: 64
+    epochs: 1
+    off_policy_num: 1
+    kl_loss_coeff: 0.0
+    learning_rate: 1e-6
+    cpu_offload: true
+    mixed_precision: true
+    forward_size: 64
+    backward_size: 16
+
+  inference:
+    train_temperature: 0.6
+    train_top_p: 0.95
+    train_top_k: -1
+    valid_temperature: 0.6
+    valid_top_p: 0.95
+    valid_top_k: -1
+    max_tokens: 8192
+    gpu_memory_utilization: 0.6
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 2
+
+monitor:
+  log_dir: "/run/determined/workdir/jiayanglyu/EasyRL/logs"
+  project_name: "GRPO_trainer_test"
+  experiment_name: "test_4"
