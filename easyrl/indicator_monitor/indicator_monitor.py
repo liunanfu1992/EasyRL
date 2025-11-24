@@ -21,7 +21,7 @@ class IndicatorMonitor:
     def log_training_reward(self, result_info, step):
         for i in result_info.keys():
             for j in result_info[i].keys():
-                self.writer.add_scalar(f"train/reward/{i}/{j}", result_info[i][j], step)
+                self.writer.add_scalar(f"train/{i}/{j}", result_info[i][j], step)
 
     def close(self):
         self.writer.close()
