@@ -60,7 +60,14 @@ This section outlines a minimal working example to help readers run the full pip
 - **Environment setup**  
   - **Python version**: Python 3.10 or later is recommended.  
   - **Hardware**: A multi‑GPU environment is recommended to fully leverage vLLM and FSDP (the default configuration assumes several GPUs).  
-  - **Dependencies**: Dependencies are specified in `pyproject.toml`. A typical editable installation can be done via:
+  - **Dependencies**: This project uses `uv` for environment and dependency management. Dependencies are specified in `pyproject.toml`, and the recommended workflow is:
+
+```bash
+uv sync
+```
+
+    which will create a virtual environment (if needed) and install all dependencies based on `pyproject.toml` and `uv.lock`.  
+    As an alternative, you can also do a standard editable installation via:
 
 ```bash
 pip install -e .
