@@ -1,8 +1,8 @@
 paths:
-  model_path: "/run/determined/workdir/jiayanglyu/model_zoo/Qwen2.5-7B"
-  train_data: "/run/determined/workdir/jiayanglyu/EasyRL/data/rl_train_with_sys_prompt.parquet"
-  valid_data: "/run/determined/workdir/jiayanglyu/EasyRL/data/rl_valid_with_sys_prompt.parquet"
-  checkpoint_dir: "/run/determined/workdir/jiayanglyu/EasyRL/checkpoint"
+  model_path: "/path/to/your/model"
+  train_data: "data/rl_train_with_sys_prompt.parquet"
+  valid_data: "data/rl_valid_with_sys_prompt.parquet"
+  checkpoint_dir: "checkpoint"
   exchange_path: "/dev/shm"
 
 actor:
@@ -34,6 +34,6 @@ actor:
     pipeline_parallel_size: 2
 
 monitor:
-  log_dir: "/run/determined/workdir/jiayanglyu/EasyRL/logs"
-  project_name: "GRPO_trainer_test"
-  experiment_name: "test_4"
+  log_dir: "logs"
+  project_name: "GRPO_trainer"
+  experiment_name: "baseline_grpo"
